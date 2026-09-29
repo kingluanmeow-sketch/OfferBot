@@ -1,6 +1,6 @@
 {
   "name": "opensea-offer-bot",
-  "version": "1.25.27",
+  "version": "1.25.30",
   "description": "OpenSea Offer Bot - Electron / Seaport 1.6 / OpenSea Stream API",
   "author": "OpenSea Offer Bot",
   "license": "UNLICENSED",
@@ -43,7 +43,7 @@
     "electronVersion": "33.4.11",
     "productName": "OpenSea Offer Bot",
     "directories": {
-      "output": "dist-build-1.25.27-official-stream",
+      "output": "dist-build-1.25.30-degraded-fallback",
       "buildResources": "assets"
     },
     "files": [
@@ -71,6 +71,7 @@
       "remote-host.js",
       "cache.js",
       "logger.js",
+      "production-trace.js",
       "license.js",
       "error-registry.js",
       "updater.js",

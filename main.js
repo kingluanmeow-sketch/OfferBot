@@ -64,6 +64,8 @@ const devIdentity = devRuntime.applyTo(app);
 const instance = require("./instance");
 
 const { logger } = require("./logger");
+const productionTrace = require("./production-trace");
+productionTrace.configure(app.getPath("userData"));
 const cache = require("./cache");
 const rateLimiter = require("./rate-limiter");
 const opensea = require("./opensea");

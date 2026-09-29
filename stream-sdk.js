@@ -7,6 +7,7 @@ const { OpenSeaStreamClient, EventType, LogLevel } = require("@opensea/sdk/strea
 const WebSocket = require("ws");
 const { decodeEvent, HANDLED_EVENTS } = require("./stream");
 const { logger } = require("./logger");
+const productionTrace = require("./production-trace");
 
 const EVENT_TYPES = Object.freeze([
   EventType.ITEM_RECEIVED_BID,
@@ -16,6 +17,13 @@ const EVENT_TYPES = Object.freeze([
   EventType.ORDER_INVALIDATE,
   EventType.ORDER_REVALIDATE
 ]);
+// Observed live 2026-09-29: the subscription ACKs, sale/transfer frames flow,
+// yet no order event arrives. A joined socket without order events cannot see
+// competitors, so it is DEGRADED (targeted REST fallback) until order events
+// are flowing again. Market-wide counts: tracked collections can be quiet.
+const ORDER_BLIND_MS = 90 * 1000;
+const ORDER_RESUME_EVENTS = 5;
+const ORDER_RESUME_WINDOW_MS = 60 * 1000;
 const CONTROL_EVENTS = new Set(["phx_reply", "phx_error", "phx_close", "phx_join", "phx_leave", "heartbeat"]);
 
 function safeText(value, max = 180) {
@@ -70,6 +78,12 @@ class OpenSeaStream {
     this.reconnectTimer = null;
     this.joinAckTimer = null;
     this.retryAttempt = 0;
+    this.eventSequence = 0;
+    this.orderBlind = false;
+    this.orderBlindTimer = null;
+    this.subscriptionActiveAt = 0;
+    this.lastOrderEventAt = 0;
+    this.orderResumeTimes = [];
     this.recentBuckets = Array.from({ length: 61 }, () => ({ second: -1, total: 0, matched: 0 }));
     this.heartbeatRefs = new Map();
     this.frameTypes = Object.create(null);
@@ -272,6 +286,8 @@ class OpenSeaStream {
     this.joinAckTimer = null;
     const wasEverActive = this.everActive;
     this.subscriptionActive = true;
+    this.subscriptionActiveAt = Date.now();
+    this.watchOrderEvents();
     this.connecting = false;
     this.authFailed = false;
     this.retryAttempt = 0;
@@ -300,10 +316,47 @@ class OpenSeaStream {
     logger.stream(`[STREAM] global subscription active · tracked=${this.collections.size}`);
   }
 
-  beginGap(reason) {
+  watchOrderEvents() {
+    if (this.orderBlindTimer) return;
+    this.orderBlindTimer = setInterval(() => this.checkOrderBlind(), 5000);
+    this.orderBlindTimer.unref?.();
+  }
+
+  checkOrderBlind(now = Date.now()) {
+    if (this.closedByUser || !this.subscriptionActive || this.orderBlind) return false;
+    if (now - Math.max(this.lastOrderEventAt, this.subscriptionActiveAt) < ORDER_BLIND_MS) return false;
+    this.orderBlind = true;
+    this.orderResumeTimes = [];
+    this.stats.orderBlindEntries = (this.stats.orderBlindEntries || 0) + 1;
+    logger.stream(`[STREAM] DEGRADED: subscription active but no order events for ${Math.round(ORDER_BLIND_MS / 1000)}s · targeted REST fallback ON`);
+    this.beginGap("order-events-blind", { keepSubscription: true });
+    return true;
+  }
+
+  noteOrderEvent(now = Date.now()) {
+    this.lastOrderEventAt = now;
+    if (!this.orderBlind) return;
+    this.orderResumeTimes.push(now);
+    while (this.orderResumeTimes.length && now - this.orderResumeTimes[0] > ORDER_RESUME_WINDOW_MS) this.orderResumeTimes.shift();
+    if (this.orderResumeTimes.length < ORDER_RESUME_EVENTS) return;
+    this.orderBlind = false;
+    this.orderResumeTimes = [];
+    const gap = this.gapStartedAt;
+    this.gapStartedAt = 0;
+    this.stats.gapRecoveries++;
+    logger.stream("[STREAM] order events flowing again · REST fallback OFF · Stream-first");
+    setImmediate(() => {
+      for (const slug of this.collections) {
+        try { this.onTopicGap(slug, gap, Date.now()); }
+        catch (error) { this.recordHandlerError(error, "order resume hook"); }
+      }
+    });
+  }
+
+  beginGap(reason, { keepSubscription = false } = {}) {
     if (!this.gapStartedAt) {
       this.gapStartedAt = Date.now();
-      this.subscriptionActive = false;
+      if (!keepSubscription) this.subscriptionActive = false;
       for (const slug of this.collections) {
         try { this.onTopicUnavailable(slug, this.gapStartedAt, safeText(reason, 80)); }
         catch (error) { this.recordHandlerError(error, "gap start hook"); }
@@ -338,6 +391,7 @@ class OpenSeaStream {
     const eventName = String(event && event.event_type || "");
     if (!HANDLED_EVENTS.has(eventName)) return;
     this.stats.marketplaceEvents++;
+    this.noteOrderEvent();
     this.lastMarketplaceEventAt = Date.now();
     const slug = eventSlug(event);
     if (!slug || !this.trackedSlugs.has(slug)) {
@@ -347,10 +401,22 @@ class OpenSeaStream {
     }
     this.stats.matchedEvents++;
     this.recordRecent(true);
+    const correlationId = `s${process.pid}-${++this.eventSequence}`;
+    const rx = { correlationId, event: eventName, collectionSlug: slug };
+    productionTrace.record("stream_rx", rx, { event: eventName, collection: slug });
     const decoded = decodeEvent({ event: eventName, topic: "collection:*", payload: event });
-    if (!decoded) return;
+    if (!decoded) {
+      productionTrace.record("stream_mapped", rx, { event: eventName, collection: slug, status: "decode-failed" });
+      return;
+    }
+    decoded.correlationId = correlationId;
+    decoded.collectionSlug = slug;
     decoded.receivedMono = receivedMono;
     decoded.decodedMono = Number(process.hrtime.bigint()) / 1e6;
+    productionTrace.record("stream_mapped", decoded, {
+      event: eventName, collection: slug, tokenId: decoded.tokenId,
+      status: decoded.nft && decoded.nft.contract && decoded.nft.tokenId ? "mapped" : "scope-event"
+    });
     try {
       this.onEvent(decoded);
     } catch (error) {
@@ -378,7 +444,9 @@ class OpenSeaStream {
   health() {
     if (this.closedByUser || !this.started || !this.collections.size) return "DISCONNECTED";
     if (this.authFailed) return "FAILED";
-    if (this.subscriptionActive && this.activeSocket && this.activeSocket.readyState === this.WebSocket.OPEN) return "HEALTHY";
+    if (this.subscriptionActive && this.activeSocket && this.activeSocket.readyState === this.WebSocket.OPEN) {
+      return this.orderBlind ? "DEGRADED" : "HEALTHY";
+    }
     return this.connecting || this.client || this.reconnectTimer ? "RECONNECTING" : "DISCONNECTED";
   }
 
@@ -430,6 +498,9 @@ class OpenSeaStream {
     this.connecting = false;
     this.subscriptionActive = false;
     this.activeSocket = null;
+    this.orderBlind = false;
+    clearInterval(this.orderBlindTimer);
+    this.orderBlindTimer = null;
     if (unsubscribe) { try { unsubscribe(); } catch {} }
     if (client) { try { client.disconnect(() => {}); } catch {} }
   }
@@ -461,6 +532,8 @@ class OpenSeaStream {
       connected: socketConnected,
       socketConnected,
       subscriptionsActive: this.subscriptionActive,
+      orderEventsBlind: this.orderBlind,
+      lastOrderEventAt: this.lastOrderEventAt,
       health: this.health(),
       marketState: matchedEvents60s ? "MARKET_EVENTS_SEEN" : this.subscriptionActive
         ? "CONNECTED_NO_TRACKED_EVENT_IN_WINDOW" : this.health(),
@@ -487,4 +560,4 @@ class OpenSeaStream {
   }
 }
 
-module.exports = { OpenSeaStream, EVENT_TYPES, eventSlug, safeText };
+module.exports = { OpenSeaStream, EVENT_TYPES, ORDER_BLIND_MS, ORDER_RESUME_EVENTS, eventSlug, safeText };

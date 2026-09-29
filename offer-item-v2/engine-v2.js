@@ -55,6 +55,7 @@ const opensea = require("../opensea");
 const devRuntime = require("../dev-runtime");
 const { Metrics, mono } = require("./metrics");
 const { PRIORITY } = require("../rate-limiter");
+const productionTrace = require("../production-trace");
 
 const STATE = Object.freeze({
   IDLE: "IDLE",
@@ -596,6 +597,12 @@ class OfferItemEngineV2 {
     this.streamHealth = typeof fn === "function" ? fn : null;
   }
 
+  /** Trace label: a Stream event, or REST while the Stream is degraded. */
+  triggerSource(event) {
+    if (/^s\d+-\d+$/.test(String(event?.correlationId || ""))) return "STREAM";
+    return this.degraded ? "DEGRADED_REST" : "REST";
+  }
+
   /** Only the ACK for this row's topic establishes live Stream coverage. */
   topicReady(row, book = null) {
     if (!row) return false;
@@ -654,7 +661,7 @@ class OfferItemEngineV2 {
        *   thêm vòng REST toàn bộ mỗi 45 giây.
        */
       const unhealthy = health === "FAILED" || health === "DISCONNECTED" ||
-        health === "RECONNECTING" || health === "STALE";
+        health === "RECONNECTING" || health === "STALE" || health === "DEGRADED";
       const now = Date.now();
       if (!unhealthy) this.unhealthySince = 0;
       else if (!this.unhealthySince) this.unhealthySince = now;
@@ -1626,6 +1633,14 @@ class OfferItemEngineV2 {
     const preEventBook = trackedNftKey ? this.book.get(trackedNftKey) : null;
     const preEventBest = preEventBook ? preEventBook.effectiveBest(receivedAt).price : 0;
     const touched = this.book.apply(op, receivedAt);
+    const trackedBookAfter = trackedNftKey ? this.book.get(trackedNftKey) : null;
+    productionTrace.record("book_update", event, {
+      chain: this.chain, collection: op.collectionSlug || event.collectionSlug,
+      tokenId: op.tokenId, affected: touched.length,
+      status: touched.length ? "applied" : "not-applied",
+      previousBest: trackedNftKey ? preEventBest : null,
+      best: trackedBookAfter ? trackedBookAfter.effectiveBest(receivedAt).price : null
+    });
     if (op.endTime > 0 && touched.length) this.noteExpiry(op.endTime);
     // Drift diagnostics (1.25.1): a Stream REMOVE that matched nothing in any
     // tracked book vs one that did. REST later finding a dead order that a
@@ -1634,7 +1649,13 @@ class OfferItemEngineV2 {
     if (op.maker && String(op.maker).toLowerCase() === String(this.builder?.address || "").toLowerCase()) {
       for (const key of touched) {
         const book = this.book.get(key);
-        if (book) book.ownKnownAt = receivedAt;
+        if (book) {
+          book.ownKnownAt = receivedAt;
+          productionTrace.record("own_update", event, {
+            chain: this.chain, collection: book.collectionSlug, tokenId: book.tokenId,
+            status: "applied", mine: book.ownBest(receivedAt).price
+          });
+        }
       }
     }
     event.bookUpdatedMono = mono();
@@ -1889,6 +1910,12 @@ class OfferItemEngineV2 {
       minPrice: row.minPrice, maxPrice: row.maxPrice, step: row.step
     });
     this.stats.decided++;
+    productionTrace.record("decision", event, {
+      chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+      status: verdict.status, reason: verdict.status, best: best.price,
+      mine: mine.price, step: verdict.effectiveStep, configuredStep: row.step,
+      max: verdict.max, target: verdict.target, source: this.triggerSource(event)
+    });
 
     if (verdict.status !== STATUS.SEND) {
       if (verdict.status === STATUS.BAD_CONFIG && row.lastError !== verdict.reason) {
@@ -1907,6 +1934,7 @@ class OfferItemEngineV2 {
       row.sendBlockedBy = { gate: "stream-topic", target: verdict.target, at: Date.now() };
       this.intents.clear(key);
       this.stats.topicHeld = (this.stats.topicHeld || 0) + 1;
+      productionTrace.record("blocked", event, { chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId, status: "WAITING", reason: "topic-not-ready", target: verdict.target });
       // A row can resume after the outage callback, or its first topic join
       // can fail before any outage callback existed. The gate itself must
       // establish the targeted recovery owner; healthy topics never enter it.
@@ -1918,6 +1946,7 @@ class OfferItemEngineV2 {
       row.sendBlockedBy = { gate: "shadow-authority-required", target: verdict.target, at: Date.now() };
       this.intents.clear(key);
       this.stats.downwardHeld = (this.stats.downwardHeld || 0) + 1;
+      productionTrace.record("blocked", event, { chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId, status: "WAITING", reason: "shadow-authority-required", target: verdict.target });
       return;
     }
 
@@ -1928,6 +1957,7 @@ class OfferItemEngineV2 {
       this.intents.clear(key);
       this.stats.lowBalanceBlocked = (this.stats.lowBalanceBlocked || 0) + 1;
       row.sendBlockedBy = { gate: "low-balance", target: verdict.target, at: Date.now() };
+      productionTrace.record("blocked", event, { chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId, status: "WAITING", reason: "low-balance", target: verdict.target });
       // Never a silent dead end: a blocked row always has a recovery owner.
       if (!this.balanceRetryTimer && !(this.balanceProbeInFlightAt && Date.now() - this.balanceProbeInFlightAt < BALANCE_PROBE_INFLIGHT_MS)) {
         this.refreshBalanceSoon(Date.now());
@@ -1944,6 +1974,7 @@ class OfferItemEngineV2 {
       this.stats.heldBeforeFirstRead = (this.stats.heldBeforeFirstRead || 0) + 1;
       row.sendBlockedBy = { gate: "first-read", target: verdict.target, at: Date.now() };
       this.intents.clear(key);
+      productionTrace.record("blocked", event, { chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId, status: "WAITING", reason: "first-read", target: verdict.target });
       return;
     }
     // Chưa có template tĩnh: KHÔNG tạo ý định (không xin lượt ghi). Dựng lại ở
@@ -1953,6 +1984,7 @@ class OfferItemEngineV2 {
       // lượt ghi). ensureTemplate xong sẽ tính lại hàng → READY.
       this.stats.heldForTemplate = (this.stats.heldForTemplate || 0) + 1;
       row.sendBlockedBy = { gate: "template", target: verdict.target, at: Date.now() };
+      productionTrace.record("blocked", event, { chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId, status: "WAITING", reason: "template", target: verdict.target });
       this.holdIntent(key, verdict, best, mine, book, receivedAt, "waiting-template");
       this.ensureTemplate(key, "evaluate");
       return;
@@ -2040,11 +2072,18 @@ class OfferItemEngineV2 {
     this.metrics.mark(traceId, "intent_updated");
     if (entry) {
       entry.traceId = traceId;
+      entry.correlationId = event?.correlationId || previous?.correlationId || entry.correlationId || "";
       entry.notBefore = Math.max(entry.notBefore || 0, retryAt);
       // A newer decision can only RAISE the priority of a pending SEND.
       const prevRank = previous && previous.target && Number.isFinite(previous.priorityRank) ? previous.priorityRank : 3;
       entry.priorityRank = Math.min(prevRank, rank);
     }
+    productionTrace.record("intent", event || { correlationId: entry?.correlationId }, {
+      chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+      status: "READY", best: best.price, mine: mine.price,
+      step: verdict.effectiveStep, max: verdict.max, target: verdict.target,
+      source: this.triggerSource(event)
+    });
     row.sendBlockedBy = null;
     // Recovery completions do not always have an outer event drain.  Once the
     // decision is committed, make it schedulable in this same turn instead of
@@ -2184,6 +2223,10 @@ class OfferItemEngineV2 {
     // is still the answer to this event, so its latency must include the wait.
     // (Finishing here made every first-after-Start send unmeasured.)
     this.metrics.mark(traceId, "own_wait_started");
+    productionTrace.record("blocked", { correlationId: intent.correlationId }, {
+      chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+      status: "WAITING", reason: "own-state-unknown", target: intent.target
+    });
     const own = this.ownDiagnostic(key);
     // Hàng chỉ mù vì POST mơ hồ của CHÍNH nó: đối soát đúng token đó (đọc
     // đầy đủ của token là một lượt kiểm own trọn vẹn). Hàng lạnh chưa từng
@@ -2209,8 +2252,17 @@ class OfferItemEngineV2 {
     // thể là resync ví — không xếp một lượt đọc không bao giờ chạy được.
     const queued = typeof this.adapter.fetchBest !== "function"
       ? (this.queueOwnResync("pre-post-own") || this.ownSyncPending)
-      : (this.queueRead(row, { reason: readReason, authoritative: false, readAt: Date.now(), firstRead: false, attempt: 1 }) ||
+      : (this.queueRead(row, { reason: readReason, authoritative: false, readAt: Date.now(), firstRead: false, attempt: 1,
+          correlationId: intent.correlationId }) ||
         this.hydrating.has(key) || this.pendingReads.has(key));
+    productionTrace.record("own_state", { correlationId: intent.correlationId }, {
+      chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+      status: "WAITING", reason: "own-state-unknown", target: intent.target,
+      ownAuthoritative: own.covered, ownSyncPending: own.ownSyncPending,
+      ownSyncAt: own.ownSyncAt, ownReconciledAt: own.ownReconciledAt,
+      ownKnownAt: own.ownKnownAt, ownUnknownAt: own.ownUnknownAt,
+      ownReadOwned: queued
+    });
     const logNow = Date.now();
     if (logNow - (row.lastDeferLogAt || 0) < 30000) return true;
     row.lastDeferLogAt = logNow;
@@ -2296,6 +2348,16 @@ class OfferItemEngineV2 {
       this.deferForOwnSync(key, row, traceId);
       return;
     }
+    {
+      const own = this.ownDiagnostic(key);
+      productionTrace.record("own_state", { correlationId: first.correlationId || traceId }, {
+        chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+        status: "covered", target: first.target, ownAuthoritative: own.covered,
+        ownSyncPending: own.ownSyncPending, ownSyncAt: own.ownSyncAt,
+        ownReconciledAt: own.ownReconciledAt, ownKnownAt: own.ownKnownAt,
+        ownUnknownAt: own.ownUnknownAt, ownReadOwned: false
+      });
+    }
 
     // ---- 1 · xin lượt ghi (nhịp toàn cục, có ưu tiên) --------------
     this.setIntent(key, INTENT.GRANTING, { brokerQueuedAt: Date.now() });
@@ -2306,6 +2368,11 @@ class OfferItemEngineV2 {
       this.log(`[SEND] SUBMIT QUEUED NFT #${row.tokenId} target=${first.target}` +
         (row.priorityMode ? " (ưu tiên)" : ""));
     }
+    productionTrace.record("send_queued", { correlationId: first.correlationId || traceId }, {
+      chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+      status: "QUEUED", best: first.best, mine: first.mine,
+      max: row.maxPrice, target: first.target
+    });
     if (this.quota) {
       const grant = await this.quota.acquire({
         lane: this.chain, domain: quotaDomain,
@@ -2624,7 +2691,13 @@ class OfferItemEngineV2 {
         apiKey: selectedApiKey,
         signal: flight?.controller?.signal || null,
         body: this.adapter.offerBody(signed, row),
-        onStage: stage => M(stage)
+        onStage: stage => {
+          M(stage);
+          if (stage === "http_started") productionTrace.record("http_start", { correlationId: first.correlationId || traceId }, {
+            chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+            status: "POST", best: first.best, mine: first.mine, max: row.maxPrice, target
+          });
+        }
       });
     } catch (error) {
       this.lastPostAt = Date.now();
@@ -2635,6 +2708,10 @@ class OfferItemEngineV2 {
       const msg = String(error && error.message || error).slice(0, 120);
       this.metrics.get(traceId)?.fail("http");
       this.metrics.finish(traceId);
+      productionTrace.record("submit_failure", { correlationId: first.correlationId || traceId }, {
+        chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+        status: "FAILED", reason: "http", target
+      });
       /**
        * CHẮC CHẮN CHƯA GỬI vs CÓ THỂ ĐÃ TỚI SERVER
        *
@@ -2692,7 +2769,11 @@ class OfferItemEngineV2 {
         // Watchdog đã thay lượt này trong lúc POST bay — nhưng OpenSea ĐÃ nhận
         // order: vẫn phải ghi own, nếu không lượt mới sẽ gửi chồng.
         this.recordOwnOrder(bookNow, posted.orderHash || signed.orderHash, target, durationMinutes,
-          Number(signed.components && signed.components.endTime) || 0);
+          Number(signed.components && signed.components.endTime) || 0, first.correlationId || traceId);
+        productionTrace.record("submit_success", { correlationId: first.correlationId || traceId }, {
+          chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+          status: "SUCCESS", mine: target, max: row.maxPrice, target
+        });
         this.log(`[SEND] SUBMIT SUCCESS NFT #${row.tokenId} ${target} WETH (lượt đã bị thay, vẫn ghi own)`);
         return;
       }
@@ -2711,7 +2792,11 @@ class OfferItemEngineV2 {
       // phản hồi, hoặc hash Seaport của chính order đã ký khi phản hồi không
       // kèm - để một SELF REMOVE về sau khớp đúng order này (1.25.10).
       this.recordOwnOrder(bookNow, posted.orderHash || signed.orderHash, target, durationMinutes,
-        Number(signed.components && signed.components.endTime) || 0);
+        Number(signed.components && signed.components.endTime) || 0, first.correlationId || traceId);
+      productionTrace.record("submit_success", { correlationId: first.correlationId || traceId }, {
+        chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+        status: "SUCCESS", best: bestNow, mine: target, max: row.maxPrice, target
+      });
       /**
        * POST 2xx LÀ TERMINAL CHO Ý ĐỊNH NÀY (port 1.19.61)
        *
@@ -3730,7 +3815,7 @@ class OfferItemEngineV2 {
    *   lại (5 giây, tối đa 5 lần); hết lượt mới tính với những gì Stream đã
    *   nói, còn hơn đứng im mãi.
    */
-  queueRead(row, { reason, authoritative, readAt, firstRead, attempt }) {
+  queueRead(row, { reason, authoritative, readAt, firstRead, attempt, correlationId = "" }) {
     const epoch = this.epoch;
     /**
      * HÀNG ĐÃ DỪNG KHÔNG CÒN ĐỌC NỮA
@@ -3794,7 +3879,8 @@ class OfferItemEngineV2 {
     // Ghi nợ: chỉ xoá khi đọc THÀNH CÔNG (xem finally và watchdog).
     const prev = this.pendingReads.get(row.key);
     if (prev && prev.timer) clearTimeout(prev.timer);
-    this.pendingReads.set(row.key, { reason, authoritative, attempt: attempt || 1, timer: null, since: prev ? prev.since : Date.now() });
+    this.pendingReads.set(row.key, { reason, authoritative, attempt: attempt || 1, timer: null,
+      since: prev ? prev.since : Date.now(), correlationId: correlationId || prev?.correlationId || "" });
     let quick = !wantsFull && typeof this.adapter.fetchBestQuick === "function";
     const readOwner = this.pendingReads.get(row.key);
     if (quick) this.readStats.quick++; else this.readStats.full++;
@@ -3818,7 +3904,8 @@ class OfferItemEngineV2 {
             if (this.epoch !== epoch || this.state !== STATE.RUNNING) return;
             if (!this.rows.has(row.key)) return;
             if (this.pendingReads.get(row.key) !== readOwner) return;
-            this.queueRead(row, { reason, authoritative, readAt: Date.now(), firstRead, attempt });
+            this.queueRead(row, { reason, authoritative, readAt: Date.now(), firstRead, attempt,
+              correlationId: readOwner.correlationId });
           }, 250);
           if (timer.unref) timer.unref();
           // The retry itself is canonical lifecycle state.  Recording it here
@@ -3900,7 +3987,8 @@ class OfferItemEngineV2 {
                 if (this.epoch !== epoch || this.state !== STATE.RUNNING) return;
                 if (!this.pendingReads.has(row.key) || this.hydrating.has(row.key)) return;
                 if (!this.rows.has(row.key)) { this.pendingReads.delete(row.key); return; }
-                this.queueRead(row, { reason, authoritative, readAt: Date.now(), firstRead: false, attempt: attempt + 1 });
+                this.queueRead(row, { reason, authoritative, readAt: Date.now(), firstRead: false,
+                  attempt: attempt + 1, correlationId: readOwner.correlationId });
               }, wait);
               if (pr.timer.unref) pr.timer.unref();
             }
@@ -4390,6 +4478,18 @@ class OfferItemEngineV2 {
         book.ownReconciledAt = Math.max(book.ownReconciledAt || 0, at);
         if ((book.ownUnknownAt || 0) > 0 && book.ownUnknownAt <= at) book.ownUnknownAt = 0;
       }
+      if (reason === "pre-post-own" || reason === "post-uncertain") {
+        const own = this.ownDiagnostic(key);
+        productionTrace.record("own_state", { correlationId: readOwner?.correlationId }, {
+          chain: this.chain, collection: row?.collectionSlug || book.collectionSlug,
+          tokenId: row?.tokenId || book.tokenId,
+          status: own.covered ? "covered" : "uncovered", reason: "own-state-unknown",
+          ownAuthoritative: own.covered, ownSyncPending: own.ownSyncPending,
+          ownSyncAt: own.ownSyncAt, ownReconciledAt: own.ownReconciledAt,
+          ownKnownAt: own.ownKnownAt, ownUnknownAt: own.ownUnknownAt,
+          ownReadOwned: Boolean(readOwner && this.pendingReads.get(key) === readOwner)
+        });
+      }
       const topicRepairAt = this.topicRepairAt.get(key) || 0;
       if (topicRepairAt && !quick && book.lastFullReadAt > topicRepairAt &&
           (!this.streamHealth || this.streamHealth(row?.collectionSlug) === "HEALTHY")) {
@@ -4844,7 +4944,7 @@ class OfferItemEngineV2 {
    *   mang hash thật cùng giá về, hash tạm được gỡ để luồng Cancel tìm đúng
    *   order (`resolveMyOffer` trả hash).
    */
-  recordOwnOrder(book, orderHash, price, durationMinutes, signedEndTime = 0) {
+  recordOwnOrder(book, orderHash, price, durationMinutes, signedEndTime = 0, correlationId = "") {
     if (!book || !(Number(price) > 0)) return;
     const now = Date.now();
     book.ownKnownAt = now;
@@ -4870,6 +4970,10 @@ class OfferItemEngineV2 {
       book.generation++;
       this.noteExpiry(endTime);
       this.changed();
+      productionTrace.record("own_update", { correlationId }, {
+        chain: this.chain, collection: book.collectionSlug, tokenId: book.tokenId,
+        status: "applied", mine: book.ownBest(now).price
+      });
       return;
     }
     // Hash thật vừa tới cho giá này: gỡ bản tạm cùng giá.
@@ -4889,6 +4993,10 @@ class OfferItemEngineV2 {
     book.generation++;
     this.noteExpiry(endTime);
     this.changed();
+    productionTrace.record("own_update", { correlationId }, {
+      chain: this.chain, collection: book.collectionSlug, tokenId: book.tokenId,
+      status: "applied", mine: book.ownBest(now).price
+    });
   }
 
   /** Tín hiệu "có gì đó đổi" cho giao diện. Rẻ; người nhận tự gộp. */

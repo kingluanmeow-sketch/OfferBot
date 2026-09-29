@@ -10,6 +10,8 @@ const suites = [
   { file: "offer-item-v2-topic-recovery-test.js" },
   { file: "offer-item-v2-recovery-read-priority-test.js" },
   { file: "stream-sdk-test.js" },
+  { file: "stream-degraded-fallback-test.js" },
+  { file: "production-trace-test.js" },
   { file: "stream-ab-architecture-test.js" },
   { file: "offer-item-v2-ab-selfcancel-test.js" },
   { file: "offer-item-v2-stress-test.js" },

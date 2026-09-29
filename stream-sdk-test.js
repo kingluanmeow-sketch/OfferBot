@@ -75,6 +75,7 @@ check("tracked item bid normalizes into the existing engine event shape", () => 
   assert.strictEqual(stream.stats.matchedEvents, 1);
   assert.strictEqual(delivered.length, 1);
   assert.strictEqual(delivered[0].event, "item_received_bid");
+  assert.match(delivered[0].correlationId, /^s\d+-\d+$/);
   assert.strictEqual(delivered[0].collectionSlug, "alpha");
   assert.strictEqual(delivered[0].nft.tokenId, "42");
   assert.strictEqual(delivered[0].orderHash, "0xabc");
