@@ -54,6 +54,7 @@ const { TraitSnapshot } = require("./trait-snapshot");
 const opensea = require("../opensea");
 const devRuntime = require("../dev-runtime");
 const { Metrics, mono } = require("./metrics");
+const { PRIORITY } = require("../rate-limiter");
 
 const STATE = Object.freeze({
   IDLE: "IDLE",
@@ -3747,6 +3748,8 @@ class OfferItemEngineV2 {
       reason === "own-top" || reason === "renew" || reason === "self-cancel" ||
       reason === "contradiction" || reason === "gate-repair" || reason === "post-uncertain" ||
       reason === "pre-post-own" || authoritative;
+    const recoveryPriority = firstRead || (this.awaitingFirstRead.has(row.key) && !(this.book.get(row.key)?.hydratedAt > 0)) ||
+      reason === "pre-post-own" || reason === "post-uncertain" ? 1 : 2;
     if (this.hydrating.has(row.key)) {
       const cur = this.pendingReads.get(row.key);
       if (cur) {
@@ -3768,7 +3771,7 @@ class OfferItemEngineV2 {
     const pushed = this.recovery.push({
       kind: reason,
       // 1 = authority chặn hàng chưa sẵn sàng; 2 = recovery có mục tiêu.
-      priority: firstRead || (this.awaitingFirstRead.has(row.key) && !(this.book.get(row.key)?.hydratedAt > 0)) || reason === "pre-post-own" || reason === "post-uncertain" ? 1 : 2,
+      priority: recoveryPriority,
       // Việc bị bỏ vì generation đổi (reconnect chen ngang): dọn dấu "đang
       // đọc" NGAY, nếu không hàng kẹt ở "Đang lấy Best Offer" và watchdog
       // tưởng đang có lượt đọc nên không cứu.
@@ -3819,6 +3822,8 @@ class OfferItemEngineV2 {
           // lượt gọi và gỡ ngay sau, để không có hàng nào mang cờ "lượt đọc
           // đầu" sang một lượt đọc khác.
           row.firstRead = Boolean(firstRead) || (this.awaitingFirstRead.has(row.key) && !(this.book.get(row.key)?.hydratedAt > 0));
+          const httpReadPriority = row.firstRead ? PRIORITY.INITIAL :
+            recoveryPriority <= 1 ? PRIORITY.P0 : PRIORITY.P2;
           // Mốc rời máy: một sự kiện tới SAU mốc này có thể không nằm trong
           // câu trả lời (xem resolveTraitScope).
           readOwner.startedAt = Date.now();
@@ -3826,9 +3831,10 @@ class OfferItemEngineV2 {
           let best;
           try {
             if (readOwner.upgradeToFull) quick = false;
-            best = quick ? await this.adapter.fetchBestQuick(row, {signal}) : await this.adapter.fetchBest(row, {signal});
+            best = quick ? await this.adapter.fetchBestQuick(row, { signal, priority: httpReadPriority })
+              : await this.adapter.fetchBest(row, { signal, priority: httpReadPriority });
             if (quick && readOwner.upgradeToFull && !signal.aborted) {
-              quick = false; best = await this.adapter.fetchBest(row, {signal});
+              quick = false; best = await this.adapter.fetchBest(row, { signal, priority: httpReadPriority });
             }
             if(signal.aborted)throw Object.assign(new Error("Read cancelled"),{name:"AbortError"});
             authoritative = authoritative || readOwner.authoritative;

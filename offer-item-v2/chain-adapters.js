@@ -435,7 +435,7 @@ class ChainAdapter {
    *
    * @param {{contract:string, tokenId:string, collectionSlug:string}} row
    */
-  async fetchBest(row, {signal} = {}) {
+  async fetchBest(row, { signal, priority = row.firstRead ? PRIORITY.INITIAL : PRIORITY.P0 } = {}) {
     /**
      * ĐỌC TƯƠI. `fetchBestOffer` mặc định trả bản cache dùng chung của cả
      * app (TTL theo cache.js). Recovery tồn tại để sửa sổ theo sự thật hiện
@@ -463,7 +463,7 @@ class ChainAdapter {
      */
     const best = await opensea.fetchBestOffer(
       this.chain, row.contract, row.tokenId, row.collectionSlug || "",
-      { useCache: false, signal, priority: row.firstRead ? PRIORITY.INITIAL : PRIORITY.P0,
+      { useCache: false, signal, priority,
         collectOrders: list => { orders = Array.isArray(list) ? list : []; } });
     /**
      * KHÔNG ĐỌC ĐƯỢC ≠ KHÔNG AI ĐẶT
@@ -530,15 +530,15 @@ class ChainAdapter {
    *   này; khi top bị huỷ mà sổ không còn item nào, engine đọc lại đúng
    *   token đó một lần (gap recovery).
    */
-  async fetchBestQuick(row, {signal} = {}) {
-    if (!row.collectionSlug) return this.fetchBest(row, {signal});   // không slug: đường đầy đủ tự giải slug
+  async fetchBestQuick(row, { signal, priority = row.firstRead ? PRIORITY.INITIAL : PRIORITY.P2 } = {}) {
+    if (!row.collectionSlug) return this.fetchBest(row, { signal, priority });   // không slug: đường đầy đủ tự giải slug
     const r = await opensea.fetchBestOfferQuick(
       this.chain, row.contract, row.tokenId, row.collectionSlug,
-      { signal, priority: row.firstRead ? PRIORITY.INITIAL : PRIORITY.P2 });
+      { signal, priority });
     // "Rỗng" chỉ đáng tin khi OpenSea nói KHÔNG CÓ offer. Top hết hạn / không
     // hoạt động (NOT_ACTIVE, EXPIRED) không nói gì về những order còn lại →
     // đọc cả danh sách thay vì kết luận "không ai".
-    if (r && r.empty === true && r.reason !== "NO_OFFER") return this.fetchBest(row, {signal});
+    if (r && r.empty === true && r.reason !== "NO_OFFER") return this.fetchBest(row, { signal, priority });
     if (r && r.empty === true) return { empty: true, orders: [] };
     // 404 "No offers found for NFT …" là CÂU TRẢ LỜI của OpenSea, không phải
     // lỗi vận chuyển: token này không có offer nào. Ném nó ra như 429/timeout
