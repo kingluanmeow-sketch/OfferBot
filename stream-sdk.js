@@ -293,6 +293,13 @@ class OpenSeaStream {
     this.retryAttempt = 0;
     this.stats.resubscribeCount += wasEverActive ? 1 : 0;
     const gap = this.gapStartedAt;
+    // Still blind to order events: a re-ACK restores nothing the engine can
+    // use. Keep the outage open; noteOrderEvent closes it when events return.
+    if (gap && this.orderBlind) {
+      this.everActive = true;
+      logger.stream(`[STREAM] subscription re-ACK while order events are absent · stays DEGRADED`);
+      return;
+    }
     if (gap) {
       this.gapStartedAt = 0;
       this.stats.gapRecoveries++;

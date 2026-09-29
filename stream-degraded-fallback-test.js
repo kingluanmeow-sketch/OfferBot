@@ -69,6 +69,17 @@ function joinedStream(callbacks = {}) {
     await check("blind detection is one outage, not repeated work", () => {
       assert.equal(unavailable.length, 2);
     });
+    // Live 2026-09-29: the SDK socket reconnects every few minutes while still
+    // blind. A re-ACK must not close the outage and reset every row's repair
+    // mark, or no REST read is ever newer than the mark and SEND stays blocked.
+    const gapBefore = stream.gapStartedAt;
+    stream.onGlobalSubscriptionReady();
+    await new Promise(r => setImmediate(r));
+    await check("re-ACK while still blind keeps the outage open (no repair reset)", () => {
+      assert.equal(stream.health(), "DEGRADED");
+      assert.deepEqual(recovered, []);
+      assert.equal(stream.gapStartedAt, gapBefore);
+    });
     for (let i = 0; i < ORDER_RESUME_EVENTS - 1; i++) captured.handler(bid("untracked", i));
     await check("a few stray events do not end DEGRADED", () => assert.equal(stream.health(), "DEGRADED"));
     captured.handler(bid("untracked", 99));
