@@ -1,6 +1,6 @@
 {
   "name": "opensea-offer-bot",
-  "version": "1.25.22",
+  "version": "1.25.23",
   "description": "OpenSea Offer Bot - Electron / Seaport 1.6 / OpenSea Stream API",
   "author": "OpenSea Offer Bot",
   "license": "UNLICENSED",
@@ -41,7 +41,7 @@
     "electronVersion": "33.4.11",
     "productName": "OpenSea Offer Bot",
     "directories": {
-      "output": "dist-build-1.25.22-topic-recovery",
+      "output": "dist-build-1.25.23-topic-recovery-hardening",
       "buildResources": "assets"
     },
     "files": [

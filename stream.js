@@ -1174,6 +1174,7 @@ class OpenSeaStream {
             js.state = "JOINED";
             js.failures = 0;
             js.retryAt = 0;
+            js.outageReported = false;
             logger.stream(`[TOPIC_JOINED] collection:${slug}${js.everJoined ? " (rejoin)" : ""}`);
             // A topic that WAS joined, dropped on protocol evidence and is now
             // back: exactly one targeted re-check for this collection.
@@ -1211,13 +1212,11 @@ class OpenSeaStream {
         // topic that had actually JOINED can have a gap. Rejoin at next sync;
         // the gap is reported once the rejoin is ACKed.
         const js = this.joinState.get(slug);
-        if (js && js.everJoined) {
-          const firstOutage = !this.topicGapPending.has(slug);
-          this.topicGapPending.add(slug);
-          if (firstOutage) {
-            try { this.onTopicUnavailable(slug, Date.now(), frame.event); }
-            catch (error) { logger.stream(`topic unavailable (${slug}): ${error.message}`); }
-          }
+        if (js && js.everJoined) this.topicGapPending.add(slug);
+        if (js && !js.outageReported) {
+          js.outageReported = true;
+          try { this.onTopicUnavailable(slug, Date.now(), frame.event); }
+          catch (error) { logger.stream(`topic unavailable (${slug}): ${error.message}`); }
         }
         if (js) js.state = "NOT_JOINED";
         logger.stream(`channel ${frame.event} for "${slug}" -> will rejoin`);
@@ -1385,12 +1384,12 @@ class OpenSeaStream {
   joinBackoff(slug, detail = "") {
     const prev = this.joinState.get(slug) || { everJoined: false, failures: 0 };
     if (prev.everJoined) {
-      const firstOutage = !this.topicGapPending.has(slug);
       this.topicGapPending.add(slug);
-      if (firstOutage) {
-        try { this.onTopicUnavailable(slug, Date.now(), `join-refused:${String(detail).slice(0, 120)}`); }
-        catch (error) { logger.stream(`topic unavailable (${slug}): ${error.message}`); }
-      }
+    }
+    const outageReported = Boolean(prev.outageReported);
+    if (!outageReported) {
+      try { this.onTopicUnavailable(slug, Date.now(), `join-refused:${String(detail).slice(0, 120)}`); }
+      catch (error) { logger.stream(`topic unavailable (${slug}): ${error.message}`); }
     }
     const failures = (prev.failures || 0) + 1;
     if (slug === GLOBAL_TOPIC && this.globalMode && failures >= GLOBAL_REFUSALS_BEFORE_FALLBACK) {
@@ -1403,7 +1402,7 @@ class OpenSeaStream {
     }
     const wait = JOIN_BACKOFF_MS[Math.min(JOIN_BACKOFF_MS.length - 1, failures - 1)];
     this.joined.delete(slug);
-    this.joinState.set(slug, { ...prev, state: "BACKOFF", failures, retryAt: Date.now() + wait });
+    this.joinState.set(slug, { ...prev, state: "BACKOFF", failures, outageReported: true, retryAt: Date.now() + wait });
     // Log the first refusal and then only when the backoff step changes.
     if (failures <= JOIN_BACKOFF_MS.length) {
       logger.stream(`join refused for "${slug}" (${failures}): ${String(detail).slice(0, 160)} -> thử lại sau ${Math.round(wait / 1000)}s`);
@@ -1445,7 +1444,8 @@ class OpenSeaStream {
       this.joined.add(slug);
       this.joinedAt.set(slug, now);
       this.joinState.set(slug, { state: "JOINING", ref, sentAt: now,
-        everJoined: Boolean(js && js.everJoined), failures: js ? js.failures : 0, retryAt: 0 });
+        everJoined: Boolean(js && js.everJoined), failures: js ? js.failures : 0,
+        outageReported: Boolean(js && js.outageReported), retryAt: 0 });
     }
     for (const slug of this.topicGapPending) if (!wanted.has(slug)) this.topicGapPending.delete(slug);
     for (const slug of this.joinState.keys()) if (!wanted.has(slug)) this.joinState.delete(slug);

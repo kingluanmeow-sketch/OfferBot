@@ -136,6 +136,33 @@ function makeEngine() {
   stream.stop();
 }
 
+// A topic refused before its first successful join still needs an owner: the
+// full initial Best may have completed while the topic remains BACKOFF.
+{
+  const unavailable = [];
+  const firstJoins = [];
+  const gaps = [];
+  const { stream, ack } = streamWithTopics(["alpha"], {
+    onTopicUnavailable: (slug, at, reason) => unavailable.push({ slug, at, reason }),
+    onTopicJoined: (slug, at) => firstJoins.push({ slug, at }),
+    onTopicGap: slug => gaps.push(slug)
+  });
+  stream.joinBackoff("alpha", "first join refused");
+  stream.joinBackoff("alpha", "retry refused");
+  check("first-join refusal has scoped recovery without duplicate outage reports", () => {
+    assert.equal(unavailable.length, 1);
+    assert.equal(unavailable[0].slug, "alpha");
+  });
+  stream.joinState.get("alpha").retryAt = 0;
+  stream.syncSubscriptions();
+  ack("alpha");
+  check("first successful join resolves first-join state without false gap", () => {
+    assert.equal(firstJoins.length, 1);
+    assert.equal(gaps.length, 0);
+  });
+  stream.stop();
+}
+
 // Recovery belongs only to running rows in the failed collection. It is a full
 // read path and is idempotent across repeated reports for the same outage.
 {
@@ -178,6 +205,58 @@ function makeEngine() {
   engine.recovery.stop();
 }
 
+// Scale check: five broken topics among sixty collections recover independently;
+// the other fifty-five still make an immediately ready Stream-first intent.
+{
+  const health = new Map();
+  const adapter = { chain: "ethereum", async fetchBest() { return { orders: [] }; } };
+  const engine = new OfferItemEngineV2({ adapter, onLog() {} });
+  engine.state = STATE.RUNNING;
+  engine.attachStreamHealth(slug => health.get(slug) || "DISCONNECTED");
+  engine.templateReady = () => true;
+  engine.pump = () => {};
+  const recoveryCalls = [];
+  const keys = new Map();
+  for (let i = 0; i < 60; i++) {
+    const slug = `collection-${String(i).padStart(2, "0")}`;
+    health.set(slug, "HEALTHY");
+    const contract = `0x${(i + 1).toString(16).padStart(40, "0")}`;
+    const key = `ethereum:${contract}:1`;
+    const row = { key, tokenId: "1", contract, collectionSlug: slug, running: true,
+      minPrice: 0.001, maxPrice: 1, step: 0.001 };
+    const book = engine.book.add({ key, chain: "ethereum", contract, tokenId: "1" });
+    book.hydratedAt = Date.now() - 1000;
+    book.lastFullReadAt = Date.now() - 1000;
+    book.effectiveBest = () => ({ price: 0.02, kind: "item", maker: "0x3333333333333333333333333333333333333333", quantity: 1 });
+    book.ownBest = () => ({ price: 0, kind: "item", maker: "", quantity: 1 });
+    engine.rows.set(key, row);
+    keys.set(slug, key);
+  }
+  engine.scheduleRecoveryRows = selected => {
+    recoveryCalls.push(selected.map(row => row.key));
+    for (const row of selected) engine.recoveryCandidates.set(row.key, { reason: "topic-gap", authoritative: false });
+    return selected.length;
+  };
+  check("60-collection partial failure preserves 55 healthy critical paths", () => {
+    for (let i = 0; i < 5; i++) {
+      const slug = `collection-${String(i).padStart(2, "0")}`;
+      health.set(slug, "RECONNECTING");
+      engine.onTopicUnavailable(slug, Date.now(), "scale-fault");
+    }
+    assert.equal(recoveryCalls.length, 5);
+    assert(recoveryCalls.flat().every(key => {
+      const row = engine.rows.get(key);
+      return row && Number(row.collectionSlug.slice(-2)) < 5;
+    }));
+    const healthyKey = keys.get("collection-59");
+    engine.evaluate(healthyKey, Date.now(), null);
+    assert.equal(engine.intents.get(healthyKey)?.state, INTENT.READY);
+    assert.equal(engine.topicRepairAt.has(healthyKey), false);
+    assert.equal(engine.recoveryCandidates.has(healthyKey), false);
+  });
+  engine.recovery.stop();
+}
+
 // Once a newer full snapshot covers an outage, repeated evaluation stays on
 // one intent and never starts a second recovery for the healthy topic.
 {
@@ -197,6 +276,73 @@ function makeEngine() {
     assert.equal(engine.intents.get(key)?.state, INTENT.READY);
     assert.equal(recoveryCalls.filter(call => call.rows.length > 0).length, 1);
     assert.equal(engine.topicRepairAt.has(key), false);
+    assert.equal(engine.diagnosticSnapshot().rows.find(item => item.key === key)?.progressState, "READY");
+  });
+  engine.recovery.stop();
+}
+
+// Create/cancel/invalidate churn during a single outage must remain under one
+// per-row recovery owner, and must not invent sends while authority is stale.
+{
+  const { engine, health, rows, recoveryCalls } = makeEngine();
+  const [key, row] = [...rows.entries()].find(([, value]) => value.collectionSlug === "alpha");
+  health.set("alpha", "RECONNECTING");
+  let admitted = 0;
+  engine.scheduleRecoveryRows = (selected, reason, opts = {}) => {
+    for (const selectedRow of selected) {
+      if (engine.recoveryCandidates.has(selectedRow.key)) continue;
+      engine.recoveryCandidates.set(selectedRow.key, { reason, authoritative: Boolean(opts.authoritative) });
+      admitted++;
+    }
+    recoveryCalls.push({ rows: selected.map(value => value.key), reason });
+    return selected.length;
+  };
+  const rival = "0x3333333333333333333333333333333333333333";
+  const baseAt = Date.now();
+  for (let i = 0; i < 300; i++) {
+    const hash = `0x${(i + 1).toString(16).padStart(64, "0")}`;
+    const eventTimestamp = baseAt + i * 3;
+    const common = { collectionSlug: "alpha", nft: { chain: "ethereum", contract: row.contract, tokenId: row.tokenId },
+      kind: "item", orderHash: hash, maker: rival, quantity: 1, currency: "WETH", endTime: 0,
+      eventTimestamp, receivedAt: eventTimestamp, hasOrderData: true };
+    engine.handleStreamEvent({ ...common, event: "item_received_bid", pricePerItem: 0.02 + i * 0.00001 });
+    engine.handleStreamEvent({ ...common, event: "order_invalidate", eventTimestamp: eventTimestamp + 1, receivedAt: eventTimestamp + 1 });
+    engine.handleStreamEvent({ ...common, event: "item_cancelled", eventTimestamp: eventTimestamp + 2, receivedAt: eventTimestamp + 2 });
+  }
+  check("300 create/invalidate/cancel events coalesce to per-row recovery owners", () => {
+    assert.equal(admitted, 2, "one candidate per running NFT in the affected collection");
+    assert.equal(engine.recoveryCandidates.size, 2);
+    assert([...engine.recoveryCandidates.keys()].every(candidate => rows.get(candidate)?.collectionSlug === "alpha"));
+    assert.equal(engine.intents.get(key), null);
+    assert.equal(engine.intents.isInFlight(key), false);
+    assert(engine.topicRepairAt.has(key));
+  });
+  engine.recovery.stop();
+}
+
+// Own-offer expiry is a local state transition and still wakes the row while
+// its topic is down; only a full snapshot newer than that outage may authorize it.
+{
+  const { engine, health, rows, books } = makeEngine();
+  const [key, row] = [...rows.entries()].find(([, value]) => value.collectionSlug === "alpha");
+  const book = books.get(key);
+  const outageAt = Date.now();
+  const expiryAt = outageAt + 20;
+  let expired = false;
+  book.ownBest = at => at < expiryAt && !expired
+    ? { price: 0.01, kind: "item", maker: "self", quantity: 1 }
+    : { price: 0, kind: "item", maker: "", quantity: 1 };
+  book.pruneExpired = at => {
+    if (!expired && at >= expiryAt) { expired = true; return 1; }
+    return 0;
+  };
+  health.set("alpha", "RECONNECTING");
+  engine.topicRepairAt.set(key, outageAt);
+  book.lastFullReadAt = outageAt + 1;
+  check("own offer expiry during topic outage reevaluates after fresh authority", () => {
+    assert.equal(engine.sweepExpired(expiryAt + 1), 1);
+    assert.equal(engine.intents.get(key)?.state, INTENT.READY);
+    assert.equal(engine.stats.ownExpired, 1);
   });
   engine.recovery.stop();
 }
@@ -214,6 +360,8 @@ function makeEngine() {
     assert(recoveryCalls.length >= 1);
     assert.equal(recoveryCalls[0].reason, "topic-gap");
     assert.equal(engine.stats.watchdogOrphans || 0, 0);
+    assert.equal(engine.diagnosticSnapshot().engine.progress.waitingStreamRecovery, 2);
+    assert.equal(engine.diagnosticSnapshot().engine.progress.permanentOrphans, 0);
   });
   engine.recovery.stop();
 }
@@ -240,6 +388,21 @@ function makeEngine() {
   engine.recovery.stop();
 }
 
+// Equal timestamps do not prove that the snapshot began after the outage.
+{
+  const { engine, health, rows, books } = makeEngine();
+  const [key, row] = [...rows.entries()][0];
+  const book = books.get(key);
+  const outageAt = Date.now();
+  health.set("alpha", "RECONNECTING");
+  engine.topicRepairAt.set(key, outageAt);
+  book.lastFullReadAt = outageAt;
+  check("authority timestamp tied with outage remains stale", () => {
+    assert.equal(engine.topicReady(row, book), false);
+  });
+  engine.recovery.stop();
+}
+
 // A topic recovery may never include paused rows, and normal healthy topics
 // continue to generate an immediately schedulable intent with no read.
 {
@@ -256,6 +419,23 @@ function makeEngine() {
   check("healthy topic keeps Stream-first intent path", () => {
     assert.equal(engine.intents.get(beta[0])?.state, INTENT.READY);
     assert.equal(recoveryCalls.length, 1, "healthy topic does not acquire REST recovery");
+  });
+  engine.recovery.stop();
+}
+
+// A row paused through the outage must acquire recovery immediately on resume,
+// even if the original outage callback had no running rows to target.
+{
+  const { engine, health, recoveryCalls, rows } = makeEngine();
+  const alpha = [...rows.entries()].filter(([, row]) => row.collectionSlug === "alpha");
+  for (const [, row] of alpha) engine.suspendRow(row.key);
+  health.set("alpha", "RECONNECTING");
+  engine.onTopicUnavailable("alpha", Date.now(), "paused-during-outage");
+  const [key] = alpha[0];
+  check("resume during topic outage immediately owns targeted recovery", () => {
+    assert.equal(engine.resumeRow(key), true);
+    assert(recoveryCalls.some(call => call.rows.includes(key)));
+    assert.equal(engine.topicRepairAt.has(key), true);
   });
   engine.recovery.stop();
 }

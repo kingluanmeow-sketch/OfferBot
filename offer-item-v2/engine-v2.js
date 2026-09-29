@@ -598,17 +598,17 @@ class OfferItemEngineV2 {
     const repairAt = this.topicRepairAt.get(row.key) || 0;
     // A complete authority read started after this topic's outage is enough
     // to safely use the local book while that one subscription rejoins.
-    if (repairAt && Number(book?.lastFullReadAt) >= repairAt) return true;
+    if (repairAt && Number(book?.lastFullReadAt) > repairAt) return true;
     if (this.streamHealth) {
       let health = "UNKNOWN";
       try { health = String(this.streamHealth(row.collectionSlug)); } catch { health = "FAILED"; }
       if (health !== "HEALTHY" && health !== "UNKNOWN") return false;
     }
-    if (!repairAt || Number(book?.lastFullReadAt) >= repairAt) return true;
+    if (!repairAt || Number(book?.lastFullReadAt) > repairAt) return true;
     // A fresh event after the ACK is P0. Let MemoryBook counter it while the
     // scoped REST repair continues in spare capacity; an old intent remains
     // blocked until a new event or a complete authority read arrives.
-    return Number(book?.lastEventAt) >= repairAt &&
+    return Number(book?.lastEventAt) > repairAt &&
       Number(book?.effectiveBest?.(Date.now())?.price) > 0;
   }
 
@@ -1876,6 +1876,10 @@ class OfferItemEngineV2 {
       row.sendBlockedBy = { gate: "stream-topic", target: verdict.target, at: Date.now() };
       this.intents.clear(key);
       this.stats.topicHeld = (this.stats.topicHeld || 0) + 1;
+      // A row can resume after the outage callback, or its first topic join
+      // can fail before any outage callback existed. The gate itself must
+      // establish the targeted recovery owner; healthy topics never enter it.
+      this.onTopicUnavailable(row.collectionSlug, row.sendBlockedBy.at, "send-blocked-topic");
       return;
     }
 
@@ -3444,7 +3448,7 @@ class OfferItemEngineV2 {
     const eligible = matching.filter(row => {
       const repairAt = this.topicRepairAt.get(row.key) || at;
       const book = this.book.get(row.key);
-      const snapshotFresh = Number(book?.lastFullReadAt) >= repairAt;
+      const snapshotFresh = Number(book?.lastFullReadAt) > repairAt;
       return !snapshotFresh && !this.hydrating.has(row.key) && !this.pendingReads.has(row.key) &&
         !this.recoveryCandidates.has(row.key);
     });
@@ -3471,7 +3475,7 @@ class OfferItemEngineV2 {
     for (const row of rows) {
       const repairAt = this.topicRepairAt.get(row.key) || 0;
       const book = this.book.get(row.key);
-      if (repairAt && Number(book?.lastFullReadAt) >= repairAt) {
+      if (repairAt && Number(book?.lastFullReadAt) > repairAt) {
         this.topicRepairAt.delete(row.key);
         this.evaluate(row.key, now, null);
       } else {
@@ -4351,7 +4355,7 @@ class OfferItemEngineV2 {
         if ((book.ownUnknownAt || 0) > 0 && book.ownUnknownAt <= at) book.ownUnknownAt = 0;
       }
       const topicRepairAt = this.topicRepairAt.get(key) || 0;
-      if (topicRepairAt && !quick && book.lastFullReadAt >= topicRepairAt &&
+      if (topicRepairAt && !quick && book.lastFullReadAt > topicRepairAt &&
           (!this.streamHealth || this.streamHealth(row?.collectionSlug) === "HEALTHY")) {
         this.topicRepairAt.delete(key);
       }
@@ -4385,7 +4389,7 @@ class OfferItemEngineV2 {
         }
       }
       const pendingTopicRepairAt = this.topicRepairAt.get(key) || 0;
-      if (pendingTopicRepairAt && book.lastFullReadAt < pendingTopicRepairAt && row?.running && this.state === STATE.RUNNING) {
+      if (pendingTopicRepairAt && book.lastFullReadAt <= pendingTopicRepairAt && row?.running && this.state === STATE.RUNNING) {
         setImmediate(() => {
           if (this.rows.get(key) === row && !this.hydrating.has(key) &&
               !this.pendingReads.has(key) && !this.recoveryCandidates.has(key)) {
@@ -5215,9 +5219,37 @@ class OfferItemEngineV2 {
       const best = book?.effectiveBest(now);
       const mine = book?.ownBest(now);
       const own = this.ownDiagnostic(key);
+      const verdict = book ? decide({ best: best.price, mine: mine.price,
+        minPrice: row.minPrice, maxPrice: row.maxPrice, step: row.step }) : { status: STATUS.NO_TARGET };
+      const topicRepairAt = this.topicRepairAt.get(key) || 0;
+      let topicHealth = "UNKNOWN";
+      try { if (this.streamHealth) topicHealth = String(this.streamHealth(row.collectionSlug)); } catch { topicHealth = "FAILED"; }
+      const authorityAfterTopicLoss = Boolean(topicRepairAt && Number(book?.lastFullReadAt) > topicRepairAt);
+      const topicReadOwner = this.pendingReads.has(key) || this.hydrating.has(key) || this.recoveryCandidates.has(key);
+      const inFlight = this.intents.isInFlight(key) || Boolean(flight);
+      let progressState = "HEALTHY";
+      if (!row.running) progressState = "PAUSED";
+      else if (inFlight || [INTENT.GRANTING, INTENT.BUILDING, INTENT.SENDING].includes(intent?.state)) progressState = "SENDING";
+      else if (intent?.state === INTENT.READY) progressState = "READY";
+      else if (intent?.state === INTENT.RETRY || row.retryAt > now) progressState = "WAITING_RETRY";
+      else if (intent?.state === INTENT.WAITING) {
+        progressState = /template/i.test(String(intent.deferredReason || "")) ? "WAITING_TEMPLATE" : "WAITING_OWN";
+      } else if (verdict.status === STATUS.SEND) {
+        const topicBlocked = row.sendBlockedBy?.gate === "stream-topic" ||
+          (topicRepairAt && !authorityAfterTopicLoss) || (topicHealth !== "HEALTHY" && topicHealth !== "UNKNOWN");
+        if (topicBlocked && (topicReadOwner || authorityAfterTopicLoss)) progressState = "WAITING_STREAM_RECOVERY";
+        else if (row.sendBlockedBy?.gate === "first-read" || row.sendBlockedBy?.gate === "shadow-authority-required") progressState = "WAITING_READ";
+        else if (row.sendBlockedBy?.gate === "template") progressState = "WAITING_TEMPLATE";
+        else if (row.sendBlockedBy?.gate === "low-balance") progressState = "WAITING_BALANCE";
+        else progressState = "ORPHAN";
+      } else if (verdict.status === STATUS.ABOVE_MAX) progressState = "MAX_BLOCKED";
+      else if (this.awaitingFirstRead.has(key) || this.renewCheck.has(key) || this.pendingReads.has(key)) progressState = "WAITING_READ";
       return {
         token: row.tokenId, key, url: row.url, running: row.running,
         bestOffer: best?.price || 0, myOffer: mine?.price || 0,
+        progressState, sendBlockedBy: row.sendBlockedBy?.gate || null,
+        topicRecovery: topicRepairAt ? { outageAt: topicRepairAt, health: topicHealth,
+          authorityAfterOutage: authorityAfterTopicLoss, owner: topicReadOwner ? "read-or-queue" : authorityAfterTopicLoss ? "fresh-authority" : "missing" } : null,
         desiredAction: intent?.target ? "SEND" : (best?.price || mine?.price ? "WATCH" : "UNKNOWN"),
         intent: intent ? { id: intent.traceId || null, state: intent.state, ageMs: intent.updatedAt ? now - intent.updatedAt : null,
           target: intent.target || 0, retryReason: intent.lastError || "", retryCount: intent.requeues || row.failures || 0,
@@ -5237,6 +5269,9 @@ class OfferItemEngineV2 {
         covered: rows.filter(r => r.ownAuthoritative).length, uncovered: rows.filter(r => !r.ownAuthoritative).length },
       broker: this.quota?.status?.() || null,
       engine: { running: this.state === STATE.RUNNING, scheduler: this.getState().scheduler,
+        progress: { permanentOrphans: rows.filter(r => r.progressState === "ORPHAN").length,
+          waitingStreamRecovery: rows.filter(r => r.progressState === "WAITING_STREAM_RECOVERY").length,
+          paused: rows.filter(r => r.progressState === "PAUSED").length },
         recovery: this.recovery.census(),
         pathB: { queuedCandidates: this.recoveryCandidates.size, sweepActive: this.recoverySweepActive,
           queuedTotal: this.stats.recoveryCandidatesQueued || 0,
