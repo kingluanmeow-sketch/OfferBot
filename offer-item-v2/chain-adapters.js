@@ -202,7 +202,7 @@ class ChainAdapter {
   }
 
   /** Phí và chuẩn token của một collection. Có TTL. */
-  async collectionConfig(slug, contract, { peek = false, tokenId = "" } = {}) {
+  async collectionConfig(slug, contract, { peek = false, tokenId = "", priority = PRIORITY.P2 } = {}) {
     const cached = this._collections.get(slug);
     if (cached && Date.now() - cached.at < COLLECTION_TTL_MS) return cached.value;
     // `peek`: chỉ trả thứ đã có trong cache. Prewarm dùng nó để KHÔNG chờ
@@ -224,11 +224,11 @@ class ChainAdapter {
      */
     let use = slug;
     if (!use && contract) {
-      use = await opensea.resolveCollectionSlug(this.chain, contract, tokenId);
+      use = await opensea.resolveCollectionSlug(this.chain, contract, tokenId, { priority });
       if (!use) throw new Error("Chưa xác định được collection của NFT này để lấy phí.");
     }
 
-    const fees = await opensea.fetchCollectionFees(use);
+    const fees = await opensea.fetchCollectionFees(use, { priority });
     const tokenStandard = await this.tokenStandard(contract, tokenId);
 
     // Cache và kết quả mang SLUG ĐÃ GIẢI, không mang chuỗi rỗng ban đầu:
@@ -530,6 +530,32 @@ class ChainAdapter {
    *   này; khi top bị huỷ mà sổ không còn item nào, engine đọc lại đúng
    *   token đó một lần (gap recovery).
    */
+  /**
+   * DEGRADED poll read (1.25.31): first page of the NFT's offer list, sorted
+   * by price and current. `/best` was measured ~30 s stale live while this
+   * list already showed the competitor's new top. One request; the winner is
+   * the highest per-item price on the page. Partial by design: never prunes.
+   */
+  async fetchBestHead(row, { signal, priority = PRIORITY.P2 } = {}) {
+    if (!row.collectionSlug) return this.fetchBestQuick(row, { signal, priority });
+    const best = await opensea.fetchBestOffer(this.chain, row.contract, row.tokenId, row.collectionSlug,
+      { useCache: false, firstPageOnly: true, signal, priority });
+    if (!best || best.ok === false) {
+      if (best && /HTTP 404|no offers found/i.test(String(best.reason || ""))) return { empty: true, orders: [], knownEmpty: true };
+      throw new Error(`không đọc được đầu danh sách offer của #${row.tokenId}: ${(best && best.reason) || "no-response"}`);
+    }
+    const price = Number(best.price) || 0;
+    if (price <= 0) return { empty: true, orders: [] };
+    const one = {
+      orderHash: String(best.orderHash || ""), price, maker: String(best.maker || "").toLowerCase(),
+      kind: best.kind === "collection" ? "collection" : best.kind === "trait" ? "trait" : "item",
+      endTime: Number(best.endTime) || 0, quantity: Number(best.quantity) || 1
+    };
+    if (!one.orderHash) throw new Error(`đầu danh sách offer của #${row.tokenId} thiếu hash`);
+    return { contract: String(row.contract).toLowerCase(), tokenId: String(row.tokenId),
+      price, maker: one.maker, orderHash: one.orderHash, kind: one.kind, endTime: one.endTime, orders: [one] };
+  }
+
   async fetchBestQuick(row, { signal, priority = row.firstRead ? PRIORITY.INITIAL : PRIORITY.P2 } = {}) {
     if (!row.collectionSlug) return this.fetchBest(row, { signal, priority });   // không slug: đường đầy đủ tự giải slug
     const r = await opensea.fetchBestOfferQuick(

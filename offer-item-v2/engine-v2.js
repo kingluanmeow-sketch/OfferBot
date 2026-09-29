@@ -137,6 +137,27 @@ const RECOVERY_CANDIDATE_INTERVAL_MS = 250;
 const FULL_RECOVERY_COOLDOWN_MS = 60 * 1000;
 /** Bao lâu kiểm sức khoẻ Stream một lần. Rẻ: chỉ đọc một chuỗi trong bộ nhớ. */
 const STREAM_HEALTH_POLL_MS = 5 * 1000;
+/**
+ * DEGRADED competitor detection (1.25.31). With the Stream blind, the flat
+ * full-read sweep (background P2, ≤1 req/s per key, several requests per row)
+ * left each row unseen for 30–80 s. One `/best` request per row, adaptive:
+ * a row that just lost top is HOT and re-polled every 2 s; others rotate with
+ * a 5 s floor. Two requests in flight at most, 250 ms apart; the read
+ * dispatcher's per-key AIMD still throttles on 429.
+ */
+const DEGRADED_POLL_TICK_MS = 100;
+// ≤ 2 req/s of the 3.2 req/s shared read ceiling (read-dispatcher.js): the
+// rest stays free for authority, own-state and recovery reads.
+const DEGRADED_POLL_SPACING_MS = 80;
+/** Dispatcher classes: after P0/INITIAL authority, before P1+ background. */
+const POLL_PRIORITY_HOT = 0.25;
+const POLL_PRIORITY_COLD = 0.75;
+const DEGRADED_POLL_CONCURRENCY = 5;
+const DEGRADED_POLL_HOT_MS = 2000;
+const DEGRADED_POLL_COLD_MIN_MS = 5000;
+const DEGRADED_POLL_HOT_WINDOW_MS = 3 * 60 * 1000;
+/** While the poller runs, the full authority sweep only repairs (pruning). */
+const DEGRADED_FULL_SWEEP_MS = 5 * 60 * 1000;
 
 /** Sau một lần bị chặn vì thiếu tiền, bao lâu mới đọc lại số dư. */
 const BALANCE_PROBE_COOLDOWN_MS = 30 * 1000;
@@ -565,6 +586,13 @@ class OfferItemEngineV2 {
     this.orphanLog = new Map();
     /** Stream không khoẻ liên tục từ lúc này (0 = đang khoẻ). */
     this.unhealthySince = 0;
+    /** DEGRADED /best poller state (1.25.31). */
+    this.degradedPollTimer = null;
+    this.pollAt = new Map();
+    this.hotUntil = new Map();
+    this.pollInFlight = new Set();
+    this.lastPollStartAt = 0;
+    this.pollSeq = 0;
     /** Bộ đếm mạng gộp — xem netStat/netDiagnostics. */
     this.net = null;
 
@@ -610,6 +638,7 @@ class OfferItemEngineV2 {
     // A complete authority read started after this topic's outage is enough
     // to safely use the local book while that one subscription rejoins.
     if (repairAt && Number(book?.lastFullReadAt) > repairAt) return true;
+    if (repairAt && this.degraded && Number(book?.lastPollAt) > repairAt) return true;
     if (this.streamHealth) {
       let health = "UNKNOWN";
       try { health = String(this.streamHealth(row.collectionSlug)); } catch { health = "FAILED"; }
@@ -672,13 +701,16 @@ class OfferItemEngineV2 {
         this.lastStreamGapAt = this.unhealthySince;
         this.stats.degradedEntries = (this.stats.degradedEntries || 0) + 1;
         this.log(`STREAM ${health} kéo dài — Path B recovery có giới hạn; Path A vẫn mở`);
+        this.startDegradedPoll();
       } else if (!unhealthy && this.degraded) {
         this.degraded = false;
+        this.stopDegradedPoll();
         this.log(`STREAM ${health} — dừng đọc lại qua REST`);
       }
 
+      const sweepEvery = this.degradedPollTimer ? DEGRADED_FULL_SWEEP_MS : DEGRADED_REHYDRATE_MS;
       if (this.degraded &&
-          Date.now() - this.degradedRehydratedAt >= DEGRADED_REHYDRATE_MS) {
+          Date.now() - this.degradedRehydratedAt >= sweepEvery) {
         this.degradedRehydratedAt = Date.now();
         // B-only round robin. Fresh Stream events keep flowing while these
         // bounded full reads repair missed state at the Path B rate.
@@ -694,6 +726,126 @@ class OfferItemEngineV2 {
     this.healthTimer = null;
     this.degraded = false;
     this.unhealthySince = 0;
+    this.stopDegradedPoll();
+  }
+
+  startDegradedPoll() {
+    if (this.degradedPollTimer || typeof this.adapter.fetchBestQuick !== "function") return;
+    this.degradedPollTimer = setInterval(() => this.degradedPollTick(Date.now()), DEGRADED_POLL_TICK_MS);
+    if (this.degradedPollTimer.unref) this.degradedPollTimer.unref();
+  }
+
+  stopDegradedPoll() {
+    if (this.degradedPollTimer) clearInterval(this.degradedPollTimer);
+    this.degradedPollTimer = null;
+    this.pollInFlight.clear();
+    this.hotUntil.clear();
+    this.pollAt.clear();
+  }
+
+  degradedPollTick(now = Date.now()) {
+    if (!this.degraded || this.state !== STATE.RUNNING) return false;
+    if (typeof this.adapter.fetchBestQuick !== "function") return false;
+    if (this.pollInFlight.size >= DEGRADED_POLL_CONCURRENCY) return false;
+    if (now - this.lastPollStartAt < DEGRADED_POLL_SPACING_MS) return false;
+    // Near the read ceiling, quiet rows yield first; a row that lost top does not.
+    let hotOnly = false;
+    try {
+      const p = opensea.readDispatcher && opensea.readDispatcher.pressure ? opensea.readDispatcher.pressure() : null;
+      hotOnly = Boolean(p && p.queuedCritical > 0);
+    } catch { hotOnly = false; }
+    const key = this.nextDegradedPollKey(now, { hotOnly });
+    if (!key) return false;
+    this.lastPollStartAt = now;
+    this.degradedPoll(key, now);
+    return true;
+  }
+
+  /** Due HOT rows first (oldest poll first), then the least recently polled row. */
+  nextDegradedPollKey(now, { hotOnly = false } = {}) {
+    let hot = null, hotAt = Infinity, cold = null, coldAt = Infinity;
+    for (const [key, row] of this.rows) {
+      // A queued background full read does not block the cheap P0 /best poll.
+      if (!row.running || this.pollInFlight.has(key) || this.flights.has(key)) continue;
+      // The first authority read owns a cold row; the poller never races it.
+      if (this.awaitingFirstRead.has(key)) continue;
+      const at = this.pollAt.get(key) || 0;
+      if ((this.hotUntil.get(key) || 0) > now) {
+        if (now - at >= DEGRADED_POLL_HOT_MS && at < hotAt) { hot = key; hotAt = at; }
+      } else if (now - at >= DEGRADED_POLL_COLD_MIN_MS && at < coldAt) { cold = key; coldAt = at; }
+    }
+    // Every second pick goes to the rotation so many HOT rows cannot starve
+    // first detection on the quiet ones.
+    if (hotOnly) { if (!hot) this.stats.degradedPollColdYield = (this.stats.degradedPollColdYield || 0) + 1; return hot; }
+    this.pollPick = (this.pollPick || 0) + 1;
+    if (hot && cold && this.pollPick % 2 === 0) return cold;
+    return hot || cold;
+  }
+
+  async degradedPoll(key, startedAt = Date.now(), { force = false, priority: forcedPriority = null } = {}) {
+    const row = this.rows.get(key);
+    if (!row) return;
+    const epoch = this.epoch;
+    const generation = this.recovery.generation;
+    const correlationId = `poll:${++this.pollSeq}`;
+    this.pollInFlight.add(key);
+    this.pollAt.set(key, startedAt);
+    this.stats.degradedPolls = (this.stats.degradedPolls || 0) + 1;
+    productionTrace.record("rest_request", { correlationId }, {
+      chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId, source: "DEGRADED_REST" });
+    let best = null;
+    try {
+      const isHot = (this.hotUntil.get(key) || 0) > startedAt;
+      const priority = forcedPriority != null ? forcedPriority : isHot ? POLL_PRIORITY_HOT : POLL_PRIORITY_COLD;
+      best = typeof this.adapter.fetchBestHead === "function"
+        ? await this.adapter.fetchBestHead(row, { priority })
+        : await this.adapter.fetchBestQuick(row, { priority });
+    } catch {
+      this.stats.degradedPollErrors = (this.stats.degradedPollErrors || 0) + 1;
+      return;
+    } finally {
+      this.pollInFlight.delete(key);
+    }
+    if (epoch !== this.epoch || this.state !== STATE.RUNNING || (!this.degraded && !force) || this.rows.get(key) !== row) return;
+    const book = this.book.get(key);
+    if (!best || !book) return;
+    // OpenSea's own arbitration after the outage edge is Best authority for
+    // the topic gate while DEGRADED (own-state authority is a separate gate).
+    book.lastPollAt = Math.max(Number(book.lastPollAt) || 0, startedAt);
+    if (best.empty) return;
+    const now = Date.now();
+    const top = Array.isArray(best.orders) && best.orders[0] ? best.orders[0] : best;
+    const price = Number(top.price) || 0;
+    const maker = String(top.maker || "").toLowerCase();
+    const self = this.builder ? String(this.builder.address || "").toLowerCase() : "";
+    productionTrace.record("rest_response", { correlationId }, {
+      chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId, best: price,
+      status: maker && maker === self ? "ON_TOP" : "applied", source: "DEGRADED_REST" });
+    // OpenSea's own arbitration says Mine is on top: nothing to do, and no
+    // full-read escalation (that was what made a quick read cost N requests).
+    if (!(price > 0)) return;
+    if (self && maker === self) {
+      // Back on top: HOT decays to one more minute of fast polling.
+      const hotUntil = this.hotUntil.get(key) || 0;
+      if (hotUntil > now) this.hotUntil.set(key, Math.min(hotUntil, now + 60 * 1000));
+      return;
+    }
+    const hash = String(top.orderHash || "");
+    const known = hash && (book.item.has(hash) || book.collection.has(hash) || book.trait.has(hash));
+    const mine = book.ownBest(now).price;
+    // Already in the book: the engine has evaluated it; nothing new to act on.
+    if (known) return;
+    this.hotUntil.set(key, now + DEGRADED_POLL_HOT_WINDOW_MS);
+    this.stats.degradedPollHits = (this.stats.degradedPollHits || 0) + 1;
+    const previousBest = book.effectiveBest(now).price;
+    this.mergeBest(key, best, generation, { quick: true, readAt: startedAt, reason: "degraded-poll" });
+    const after = this.book.get(key);
+    // A competitor at or above Max cannot be beaten: no fast polling for it.
+    const afterBest = after ? after.effectiveBest(Date.now()).price : 0;
+    if (Number(row.maxPrice) > 0 && afterBest >= Number(row.maxPrice) - 1e-12) this.hotUntil.delete(key);
+    productionTrace.record("book_update", { correlationId }, {
+      chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId, status: "applied",
+      previousBest, best: after ? after.effectiveBest(Date.now()).price : null, mine, source: "DEGRADED_REST" });
   }
 
   /**
@@ -818,6 +970,36 @@ class OfferItemEngineV2 {
    * Đăng ký MỘT hàng vào engine: bảng hàng + sổ. Cùng một đường cho Start
    * (mọi hàng) và cho Add lúc đang chạy (`addRows`), để hai đường không lệch.
    */
+  /**
+   * Bootstrap milestones (1.25.31): ADD/RUN -> template -> first read ->
+   * Decision -> first POST queued -> first success (or ON_TOP / ABOVE_MAX).
+   */
+  bootstrapMark(key, stage, at = Date.now(), outcome = "") {
+    const row = this.rows.get(key);
+    if (!row) return;
+    const b = row.bootstrap || (row.bootstrap = { startAt: at });
+    if (b.done || b[stage]) return;
+    b[stage] = at;
+    if (stage !== "successAt" && stage !== "terminalAt") return;
+    b.done = true;
+    const d = x => (b[x] ? b[x] - b.startAt : null);
+    const rec = { outcome, total: at - b.startAt, template: d("templateAt"), firstRead: d("firstReadAt"),
+      decision: d("decisionAt"), queued: d("queuedAt"), at };
+    this.bootstrapLog = this.bootstrapLog || [];
+    this.bootstrapLog.push(rec);
+    if (this.bootstrapLog.length > 300) this.bootstrapLog.shift();
+    productionTrace.record("bootstrap", {}, { chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+      status: outcome, tTotal: rec.total, tTemplate: rec.template, tFirstRead: rec.firstRead, tDecision: rec.decision, tQueued: rec.queued });
+  }
+
+  bootstrapStats() {
+    const list = (this.bootstrapLog || []).filter(r => r.outcome === "SUCCESS");
+    const p = (k, q) => { const a = list.map(r => r[k]).filter(x => x != null).sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(a.length * q))] : null; };
+    return { firstSends: list.length, terminals: (this.bootstrapLog || []).length,
+      totalMs: { p50: p("total", .5), p95: p("total", .95), max: p("total", 1) },
+      templateMs: p("template", .5), firstReadMs: p("firstRead", .5), queuedMs: p("queued", .5) };
+  }
+
   registerRow(row) {
     const key = tokenKey(this.chain, row.contract, row.tokenId);
     this.rows.set(key, {
@@ -845,6 +1027,8 @@ class OfferItemEngineV2 {
       priorityMode: Boolean(row.priorityMode),
       /** One dispatch boost for an explicit user Start/Resume. */
       manualPriorityAt: 0,
+      /** ADD/RUN -> first send milestones (1.25.31). */
+      bootstrap: { startAt: Date.now() },
       /** OpenSea vừa từ chối vì ví không đủ WETH. */
       lowBalance: false,
       lastError: "",
@@ -1437,7 +1621,18 @@ class OfferItemEngineV2 {
     }
     // Min/Max/Step đổi là một transition của verdict: đánh thức hàng (1.25.2).
     if (fields.minPrice !== undefined || fields.maxPrice !== undefined || fields.step !== undefined) {
+      // 1.25.31: a raised Max must act now. Drop the stale retry timer and a
+      // terminal verdict from the old config, wake on the current book, and
+      // take one fresh P0 Best read so the recalc does not wait for polling,
+      // expiry or the watchdog (production: Max raised above Best, bot idle).
+      row.retryAt = 0;
+      const it = this.intents.get(key);
+      if (it && it.state === INTENT.FAILED && !this.intents.isInFlight(key)) this.intents.clear(key);
       this.scheduleRowWake(key, "config");
+      if (this.state === STATE.RUNNING && row.running && typeof this.adapter.fetchBestHead === "function" &&
+          !this.pollInFlight.has(key)) {
+        this.degradedPoll(key, Date.now(), { force: true, priority: PRIORITY.P0 });
+      }
     }
     return true;
   }
@@ -1634,7 +1829,7 @@ class OfferItemEngineV2 {
     const preEventBest = preEventBook ? preEventBook.effectiveBest(receivedAt).price : 0;
     const touched = this.book.apply(op, receivedAt);
     const trackedBookAfter = trackedNftKey ? this.book.get(trackedNftKey) : null;
-    productionTrace.record("book_update", event, {
+    if (touched.length) productionTrace.record("book_update", event, {
       chain: this.chain, collection: op.collectionSlug || event.collectionSlug,
       tokenId: op.tokenId, affected: touched.length,
       status: touched.length ? "applied" : "not-applied",
@@ -1916,6 +2111,8 @@ class OfferItemEngineV2 {
       mine: mine.price, step: verdict.effectiveStep, configuredStep: row.step,
       max: verdict.max, target: verdict.target, source: this.triggerSource(event)
     });
+    this.bootstrapMark(key, "decisionAt");
+    if (verdict.status === STATUS.ON_TOP || verdict.status === STATUS.ABOVE_MAX) this.bootstrapMark(key, "terminalAt", Date.now(), verdict.status);
 
     if (verdict.status !== STATUS.SEND) {
       if (verdict.status === STATUS.BAD_CONFIG && row.lastError !== verdict.reason) {
@@ -2368,6 +2565,7 @@ class OfferItemEngineV2 {
       this.log(`[SEND] SUBMIT QUEUED NFT #${row.tokenId} target=${first.target}` +
         (row.priorityMode ? " (ưu tiên)" : ""));
     }
+    this.bootstrapMark(key, "queuedAt");
     productionTrace.record("send_queued", { correlationId: first.correlationId || traceId }, {
       chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
       status: "QUEUED", best: first.best, mine: first.mine,
@@ -2770,6 +2968,7 @@ class OfferItemEngineV2 {
         // order: vẫn phải ghi own, nếu không lượt mới sẽ gửi chồng.
         this.recordOwnOrder(bookNow, posted.orderHash || signed.orderHash, target, durationMinutes,
           Number(signed.components && signed.components.endTime) || 0, first.correlationId || traceId);
+        this.bootstrapMark(key, "successAt", Date.now(), "SUCCESS");
         productionTrace.record("submit_success", { correlationId: first.correlationId || traceId }, {
           chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
           status: "SUCCESS", mine: target, max: row.maxPrice, target
@@ -2793,6 +2992,7 @@ class OfferItemEngineV2 {
       // kèm - để một SELF REMOVE về sau khớp đúng order này (1.25.10).
       this.recordOwnOrder(bookNow, posted.orderHash || signed.orderHash, target, durationMinutes,
         Number(signed.components && signed.components.endTime) || 0, first.correlationId || traceId);
+      this.bootstrapMark(key, "successAt", Date.now(), "SUCCESS");
       productionTrace.record("submit_success", { correlationId: first.correlationId || traceId }, {
         chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
         status: "SUCCESS", best: bestNow, mine: target, max: row.maxPrice, target
@@ -3116,6 +3316,7 @@ class OfferItemEngineV2 {
 
   /** Dựng template cho MỘT hàng từ cấu hình đã có; ném khi không dựng được. */
   applyTemplate(row, config, account, collection) {
+    this.bootstrapMark(row.key, "templateAt");
     this.builder.hydrate(row.key, {
       chain: this.chain,
       chainId: config.chainId,
@@ -3188,7 +3389,21 @@ class OfferItemEngineV2 {
         if (this.epoch !== epoch) return;
         this.accountCfg = account;
       }
-      const collection = await this.adapter.collectionConfig(row.collectionSlug, row.contract, { tokenId: row.tokenId });
+      /**
+       * NFT MỚI: TEMPLATE XIN Ở HẠNG INITIAL, KHÔNG PHẢI P0 THƯỜNG
+       *
+       *   Live 2026-09-29: một hàng mới Add mất 35/38s chờ đúng đây — không
+       *   vì mạng chậm, mà vì lượt đọc phí collection P0 của nó xếp hàng FIFO
+       *   sau hàng chục lượt đọc P0 khác cùng hạng (own-state-unknown
+       *   pre-post-own của các hàng cũ dùng chung P0). Một hàng CHƯA TỪNG có
+       *   template (bootstrap.templateAt chưa từng đặt) là lời hứa "Add xong
+       *   sẽ được nhìn tới" giống hệt lượt đọc đầu tiên — nên đi cùng hạng
+       *   INITIAL. Một khi đã có template, các lần dựng lại sau (counter đổi)
+       *   quay về P0 thường, không giữ ưu tiên vĩnh viễn.
+       */
+      const bootstrapping = row.bootstrap && !row.bootstrap.templateAt;
+      const collection = await this.adapter.collectionConfig(row.collectionSlug, row.contract,
+        { tokenId: row.tokenId, priority: bootstrapping ? PRIORITY.INITIAL : PRIORITY.P0 });
       if (this.epoch !== epoch) return;
       /**
        * SLUG GIẢI ĐƯỢC THÌ GHI NGƯỢC VÀO HÀNG
@@ -4503,6 +4718,7 @@ class OfferItemEngineV2 {
       const gateOpened = snapshotAt >= closedAt;
       if (gateOpened) {
         this.awaitingFirstRead.delete(key);
+        this.bootstrapMark(key, "firstReadAt");
         this.gateClosedAt.delete(key);
         if (!quick) {
           this.renewCheck.delete(key); this.renewSince.delete(key);

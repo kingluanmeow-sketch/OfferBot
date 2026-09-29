@@ -8,7 +8,7 @@ const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_QUEUE = 20000;
 const MAX_BATCH = 256;
 const EVENTS = new Set(["item_received_bid", "collection_offer", "trait_offer", "item_cancelled", "order_invalidate", "order_revalidate"]);
-const STAGES = new Set(["stream_rx", "stream_mapped", "book_update", "decision", "intent", "blocked", "own_state", "own_update", "send_queued", "http_start", "submit_success", "submit_failure"]);
+const STAGES = new Set(["stream_rx", "stream_mapped", "book_update", "decision", "intent", "blocked", "own_state", "own_update", "send_queued", "http_start", "submit_success", "submit_failure", "rest_request", "rest_response", "bootstrap"]);
 const REASONS = new Set(["SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "topic-not-ready", "shadow-authority-required", "low-balance", "first-read", "template", "own-state-unknown", "not-applied", "applied", "http", "stale-before-post", "quota", "build", "cancelled", "other"]);
 const STATUSES = new Set(["mapped", "scope-event", "decode-failed", "applied", "not-applied", "covered", "uncovered", "SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "READY", "WAITING", "QUEUED", "POST", "SUCCESS", "FAILED"]);
 const SOURCES = new Set(["STREAM", "DEGRADED_REST", "REST"]);
@@ -43,7 +43,9 @@ function record(stage, event, detail = {}) {
     ownReadOwned: typeof detail.ownReadOwned === "boolean" ? detail.ownReadOwned : null,
     affected: Number.isInteger(detail.affected) && detail.affected >= 0 ? detail.affected : null,
     eventTimestamp: cleanNumber(event && event.eventTimestamp),
-    source: SOURCES.has(detail.source) ? detail.source : ""
+    source: SOURCES.has(detail.source) ? detail.source : "",
+    tTotal: cleanNumber(detail.tTotal), tTemplate: cleanNumber(detail.tTemplate), tFirstRead: cleanNumber(detail.tFirstRead),
+    tDecision: cleanNumber(detail.tDecision), tQueued: cleanNumber(detail.tQueued)
   };
   queue.push(JSON.stringify(row) + "\n"); schedule(); return true;
 }

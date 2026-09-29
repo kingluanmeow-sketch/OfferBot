@@ -95,6 +95,13 @@ const START_BURST = 3;
 const RATE_FLOOR = 0.25;
 const RATE_CEILING = 8;
 const RECOVER_EVERY_MS = 3000;
+/** Order-posting ceilings at 80% of the dashboard (Key 1 2/s, Key 2 1/s). */
+// Start at the dashboard rate (Key 1 2/s, Key 2 1/s); soft ceilings far above
+// it so upgraded keys are used; AIMD (429 halves) finds the real limit.
+// Owner 2026-09-30 (final): dashboard ceilings at 90%, keys not added.
+const WRITE_CAPS = [2 * 0.9, 1 * 0.9];
+const WRITE_START = [2 * 0.9, 1 * 0.9];
+const WRITE_BURSTS = [2, 1];
 
 function fingerprint(apiKey) {
   const raw = String(apiKey || "").trim();
@@ -525,6 +532,13 @@ class QuotaBroker extends EventEmitter {
     this.model = new QuotaModel({ startRps });
     /** Một AIMD controller cho mỗi API-key fingerprint/quota domain. */
     this.models = new Map([["default", this.model]]);
+    /**
+     * 1.25.31 dashboard ceilings for order posting: Key 1 2/s, Key 2 1/s, and
+     * OpenSea may share self-serve limits across an account's keys. Run at
+     * 80%: per-key caps by position in the request's domain list, plus one
+     * shared model every grant must also pass.
+     */
+    this.shared = new QuotaModel({ startRps: 2 * 0.9, burst: 1, rateCeiling: 2 * 0.9 });
     this.queue = new FairQueue();
 
     /** Yêu cầu của CHÍNH tiến trình này đang chờ trả lời (khi là follower). */
@@ -823,6 +837,8 @@ class QuotaBroker extends EventEmitter {
   applyReport(msg) {
     const model = this.modelFor(msg.domain);
     if (msg.headers) model.learn(msg.headers);
+    // A 429 on a possibly shared account pool slows every key.
+    if (msg.retryAfterMs || Number(msg.status) === 429) this.shared.observe({ status: 429 });
     if (msg.retryAfterMs) {
       model.penalize(msg.retryAfterMs);
       this.log(`429 → chặn domain ${msg.domain || "default"} ${msg.retryAfterMs}ms cho mọi tiến trình`);
@@ -921,10 +937,26 @@ class QuotaBroker extends EventEmitter {
    *   hoà thì key được cấp lâu nhất trước thắng — chia đều, không ưu tiên
    *   cố định Key 1.
    */
+  capModel(model, index) {
+    const i = Math.min(index, WRITE_CAPS.length - 1);
+    if (model.capIndex === i) return model;
+    const first = model.capIndex === undefined;
+    model.capIndex = i;
+    model.rateCeiling = WRITE_CAPS[i];
+    model.startRps = WRITE_START[i];
+    model.rate = first ? WRITE_START[i] : Math.min(model.rate, WRITE_CAPS[i]);
+    model.burst = WRITE_BURSTS[i];
+    model.tokens = Math.min(model.tokens, model.burst);
+    return model;
+  }
+
   pickDomain(req, mono = QuotaModel.mono()) {
+    if (!this.shared.check(mono).ok) return null;
     let best = null, bestModel = null;
-    for (const domain of this.domainsOf(req)) {
-      const model = this.modelFor(domain);
+    const list = this.domainsOf(req);
+    for (let i = 0; i < list.length; i++) {
+      const domain = list[i];
+      const model = this.capModel(this.modelFor(domain), i);
       if (!model.check(mono).ok) continue;
       if (!bestModel ||
           model.tokens > bestModel.tokens + 1e-9 ||
@@ -937,13 +969,16 @@ class QuotaBroker extends EventEmitter {
 
   /** Thời gian chờ ngắn nhất tới khi BẤT KỲ domain nào của yêu cầu ghi được. */
   waitFor(req, mono = QuotaModel.mono()) {
+    const shared = this.shared.check(mono);
+    const sharedWait = shared.ok ? 0 : Math.max(1, Number(shared.waitMs) || 20);
     let wait = Infinity;
-    for (const domain of this.domainsOf(req)) {
-      const check = this.modelFor(domain).check(mono);
-      if (check.ok) return 0;
+    const list = this.domainsOf(req);
+    for (let i = 0; i < list.length; i++) {
+      const check = this.capModel(this.modelFor(list[i]), i).check(mono);
+      if (check.ok) return sharedWait;
       wait = Math.min(wait, Math.max(1, Number(check.waitMs) || 20));
     }
-    return wait;
+    return Math.max(wait, sharedWait);
   }
 
   nextQueueWait() {
@@ -966,6 +1001,7 @@ class QuotaBroker extends EventEmitter {
     if (!domain) return null;
     const model = this.modelFor(domain);
     if (!model.take()) return null;
+    this.shared.take();
     this.stats.granted++;
     this.stats.grantsByDomain = this.stats.grantsByDomain || {};
     this.stats.grantsByDomain[domain] = (this.stats.grantsByDomain[domain] || 0) + 1;

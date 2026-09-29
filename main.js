@@ -75,7 +75,7 @@ const linkList = require("./link-list");
 const { profiler } = require("./latency");
 const browser = require("./browser");
 const wallet = require("./wallet");
-const { OpenSeaStream } = require("./stream-sdk");
+const { ShardedOpenSeaStream: OpenSeaStream } = require("./stream-sdk");
 /**
  * ENGINE OFFER ITEM CŨ KHÔNG CÒN TRONG SẢN PHẨM
  *
@@ -1428,12 +1428,29 @@ function startHousekeeping() {
           `${n.stream.degraded ? " DEGRADED" : ""} · total write=${(n.total || {}).write || 0} 429=${(n.total || {})["429"] || 0}`);
       }
       const planeActivity = d.apiRead + d.metadata + d.gql + d.webNav + d.profileReads + d.reconnect + d.topicRejoin + d.joinRefused + d.workerCreated;
-      if (!planeActivity && !engineActivity && st.mode !== "official-global") return;
+      if (!planeActivity && !engineActivity && st.mode !== "official-global" && st.mode !== "official-collections") return;
       const subs = st.subscriptions ? ` subs joined=${st.subscriptions.JOINED || 0} joining=${st.subscriptions.JOINING || 0} backoff=${st.subscriptions.BACKOFF || 0}` : "";
-      const gl = st.mode === "official-global"
+      const gl = st.mode === "official-global" || st.mode === "official-collections"
         ? ` STREAM connected=${Boolean(st.socketConnected)} active=${Boolean(st.subscriptionsActive)} mode=${st.mode} state=${st.marketState || st.health} marketplaceEvents60s=${st.marketplaceEvents60s || 0} matched60s=${st.matchedEvents60s || 0} untracked60s=${st.untrackedEvents60s || 0} lastEventAgeMs=${st.lastEventAgeMs ?? -1} reconnect=${st.reconnect || 0} handlerErrors=${st.handlerErrors || 0} gap=${st.streamGapStartedAt || 0} rxFrames=${d.streamFrames} controlFrames=${d.streamControlFrames} lastFrame=${st.lastFrameType || "-"}`
         : st.global ? ` feed=${st.global.mode} tracked=${st.global.tracked} rx=${d.streamFrames}(ctrl=${d.streamControlFrames} market=${d.streamMarketplaceFrames} other=${d.streamUnclassifiedFrames}) handled=${d.streamHandled} dropped=${d.streamDropped} bytes=${d.streamBytes} lastFrame=${st.lastFrameType || "-"} joinReply=${st.lastJoinReplyStatus || "-"}:${st.lastJoinReplyTopic || "-"}` : "";
-      logger.engine(`[NET] 60s · streamEvents=${d.streamEvents} reconnect=${d.reconnect} rejoin=${d.topicRejoin} joinRefused=${d.joinRefused} · ` +
+      let quota = "";
+      try {
+        const rs = opensea.readDispatcher.stats();
+        quota = ` · READ quota used=${rs.global.usedRps60s}/${rs.global.ceilingRps}rps (${Math.round(rs.global.utilization * 100)}%) ` +
+          `q=${rs.queued}(crit=${rs.queuedCritical} bg=${rs.queuedBackground}) wait all p50/p95/max=${rs.waitMs.p50}/${rs.waitMs.p95}/${rs.waitMs.max}ms realtime p50/p95/max=${rs.realtimeWaitMs.p50}/${rs.realtimeWaitMs.p95}/${rs.realtimeWaitMs.max}ms ` +
+          `429 60s/total=${rs.global.rateLimited60s}/${rs.global.rateLimitedTotal} ` +
+          `keys[${rs.keys.map(k => `cap${k.capRps}:${k.rps.toFixed(2)}/${k.capRps}rps g${k.grants} 429x${k.rateLimited}`).join(" ")}]`;
+        for (const [chain, bridge] of engines) {
+          const eng = bridge && bridge.engine ? bridge.engine : bridge;
+          const s = (eng && eng.stats) || {};
+          if (eng && typeof eng.bootstrapStats === "function") {
+            const b = eng.bootstrapStats();
+            if (b.terminals) quota += ` · ${chain} bootstrap firstSend=${b.firstSends}/${b.terminals} ADD->FIRST SEND p50/p95/max=${b.totalMs.p50}/${b.totalMs.p95}/${b.totalMs.max}ms (template p50=${b.templateMs} firstRead p50=${b.firstReadMs} queued p50=${b.queuedMs})`;
+          }
+          if (eng && eng.degradedPollTimer) quota += ` · ${chain} poll=${s.degradedPolls || 0} hits=${s.degradedPollHits || 0} hot=${eng.hotUntil ? eng.hotUntil.size : 0} coldYield=${s.degradedPollColdYield || 0} err=${s.degradedPollErrors || 0}`;
+        }
+      } catch { quota = ""; }
+      logger.engine(`[NET] 60s${quota} · streamEvents=${d.streamEvents} reconnect=${d.reconnect} rejoin=${d.topicRejoin} joinRefused=${d.joinRefused} · ` +
         `apiRead=${d.apiRead} metadata=${d.metadata} gql=${d.gql} · webNav=${d.webNav} profileNav=${d.profileNav} profileReads=${d.profileReads} ` +
         `worker +${d.workerCreated}/-${d.workerIdle} (${wk.alive ? "alive" : "off"})${subs}${gl} | ` + parts.join(" | "));
     } catch (error) {
@@ -2263,7 +2280,11 @@ function registerIpc() {
       if (!slugPromise.has(parsed.contract)) {
         slugPromise.set(parsed.contract, (async () => {
           try {
-            const meta = await opensea.fetchNftMeta(chain, parsed.contract, parsed.tokenId);
+            // 1.25.31: Add's own metadata resolution is bootstrap work for a
+            // brand-new row, not routine upkeep. At the default P2 it queued
+            // behind ~120 running rows' background traffic — measured live,
+            // addNfts took >25s to even resolve one NFT's collection slug.
+            const meta = await opensea.fetchNftMeta(chain, parsed.contract, parsed.tokenId, { priority: rateLimiter.PRIORITY.INITIAL });
             if (meta) metaByUrl.set(parsed.url, meta);
             const slug = String(meta?.collectionSlug || "").toLowerCase();
             if (slug) slugByContract.set(parsed.contract, slug);
@@ -2370,8 +2391,14 @@ function registerIpc() {
           try {
             const slug = await resolveSlug(parsed);
             let orders = [];
+            // 1.25.31: this IS the row's authoritative first read, before it
+            // even exists in engine.rows (so row.firstRead can't mark it).
+            // Left at the default P0 it queues FIFO behind every existing
+            // row's own-state-unknown P0 reads — measured live, Add took
+            // over 30s per NFT against 120+ running rows.
             const best = await opensea.fetchBestOffer(chain, parsed.contract, parsed.tokenId, slug, {
               useCache: false,
+              priority: rateLimiter.PRIORITY.INITIAL,
               collectOrders: list => { orders = Array.isArray(list) ? list : []; }
             });
             best.collectedOrders = orders;

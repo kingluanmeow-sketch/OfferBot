@@ -1469,7 +1469,7 @@ async function fetchCollectionSupply(collectionSlug) {
   return total;
 }
 
-async function fetchCollectionFees(collectionSlug) {
+async function fetchCollectionFees(collectionSlug, { priority = PRIORITY.P2 } = {}) {
   const slug = String(collectionSlug || "").trim();
   if (!slug) throw new Error("Thieu collection slug de lay fees.");
 
@@ -1479,9 +1479,11 @@ async function fetchCollectionFees(collectionSlug) {
   // Once per collection, cached 30 minutes, needed to BUILD a template — not
   // on the per-send path (a missing template defers the send; it never holds
   // a write slot). Background lane, Key 2 first.
+  // 1.25.31: a template that gates a pending SEND asks at P0 (live: rows sat
+  // on BLOCKED: template behind the background lane); default stays P2.
   const response = await apiGet(`/collections/${encodeURIComponent(slug)}`, {
     kind: KIND.READ,
-    priority: PRIORITY.P2,
+    priority,
     timeout: 12000,
     label: "collection-fees"
   });
@@ -1936,7 +1938,11 @@ async function fetchBestOffer(chain, contract, tokenId, collectionSlug = "", opt
   const {
     useCache = true,
     collectOrders = null,
-    priority = PRIORITY.P0, signal = null
+    priority = PRIORITY.P0, signal = null,
+    // 1.25.31: head read for DEGRADED polling. The list endpoint is sorted by
+    // price and current, while /best lagged ~30 s live; one page is enough to
+    // see a new top. Never cached, never used to prune (partial).
+    firstPageOnly = false
   } = opts;
 
   const c = normalizeChain(chain);
@@ -1983,7 +1989,8 @@ async function fetchBestOffer(chain, contract, tokenId, collectionSlug = "", opt
       `/offers/collection/${encodeURIComponent(slug)}/nfts/${encodeURIComponent(
         requestedTokenId
       )}`,
-      { label: "nft-offers", priority, signal, maxPages: NFT_OFFER_MAX_PAGES }
+      { label: firstPageOnly ? "nft-offers-head" : "nft-offers", priority, signal,
+        maxPages: firstPageOnly ? 1 : NFT_OFFER_MAX_PAGES }
     );
   } catch (error) {
     return fail(describeError(error), "read-failed", slug);
@@ -2170,7 +2177,7 @@ async function fetchBestOffer(chain, contract, tokenId, collectionSlug = "", opt
         : "")
   );
 
-  bestOfferCache.set(key, result);
+  if (!firstPageOnly) bestOfferCache.set(key, result);
   return result;
 }
 

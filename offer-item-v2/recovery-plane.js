@@ -38,7 +38,10 @@ class RecoveryPlane {
       let busy=false;try{busy=this.pressure()===true;}catch{busy=false;}
       const i=this.queue.findIndex(j=>{
         if(j.priority<=1)return true;
-        if(this.background>=this.workers-1||this.tokens<1)return false;
+        // Background waits downstream for background read slots while holding
+        // a worker; capped at half so authority reads (priority<=1) that gate a
+        // SEND always have workers (1.25.31: 5 of 6 left one, 40-60 s waits).
+        if(this.background>=Math.floor(this.workers/2)||this.tokens<1)return false;
         if(!busy)return true;
         const aged=now-j.queuedAt>=(j.priority>=3?RecoveryPlane.PRESSURE_WAIT_P3_MS:RecoveryPlane.PRESSURE_WAIT_P2_MS);
         if(!aged)this.stats.yieldedToRealtime++;

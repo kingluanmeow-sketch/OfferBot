@@ -51,6 +51,13 @@ class OpenSeaStream {
     this.onTopicGap = typeof options.onTopicGap === "function" ? options.onTopicGap : () => {};
     this.onTopicJoined = typeof options.onTopicJoined === "function" ? options.onTopicJoined : () => {};
     this.onTopicUnavailable = typeof options.onTopicUnavailable === "function" ? options.onTopicUnavailable : () => {};
+    // 1.25.31: subscribe tracked collections instead of the "*" firehose.
+    // Live: "*" pushed 640 MB / 354k events in minutes (97% untracked) and the
+    // server closed the socket every 2-3 s with 4500 "configured send limit".
+    this.perCollection = options.perCollection === true;
+    this.topicUnsubs = new Map();
+    this.refusedTopics = new Set();
+    this.label = String(options.label || "");
     this.Client = dependencies.OpenSeaStreamClient || OpenSeaStreamClient;
     this.Types = dependencies.EventType || EventType;
     this.WebSocket = dependencies.WebSocket || WebSocket;
@@ -121,7 +128,7 @@ class OpenSeaStream {
     this.setCollectionSet(slugs);
     if (!this.started || this.closedByUser) return;
     if (!this.collections.size) this.stopClient();
-    else this.ensureClient();
+    else if (!this.ensureClient()) this.syncTopics();
   }
 
   ensureClient() {
@@ -162,17 +169,16 @@ class OpenSeaStream {
         logLevel: LogLevel.ERROR,
         onError: error => this.onSdkError(generation, error)
       });
-      this.unsubscribe = this.client.onEvents("*", [
-        this.Types.ITEM_RECEIVED_BID,
-        this.Types.COLLECTION_OFFER,
-        this.Types.TRAIT_OFFER,
-        this.Types.ITEM_CANCELLED,
-        this.Types.ORDER_INVALIDATE,
-        this.Types.ORDER_REVALIDATE
-      ], event => this.handleSdkEvent(generation, event));
+      if (this.perCollection) {
+        this.topicUnsubs.clear();
+        for (const slug of this.collections) this.subscribeTopic(slug, generation);
+        this.unsubscribe = () => { for (const u of this.topicUnsubs.values()) { try { u(); } catch {} } this.topicUnsubs.clear(); };
+      } else {
+        this.unsubscribe = this.client.onEvents("*", this.eventTypes(), event => this.handleSdkEvent(generation, event));
+      }
       this.lastError = "";
       this.retryAttempt = 0;
-      logger.stream(`[STREAM] official SDK v12.10.2 · mode=official-global · tracked=${this.collections.size}`);
+      logger.stream(`[STREAM] official SDK v12.10.2 · mode=${this.perCollection ? "official-collections" : "official-global"}${this.label} · tracked=${this.collections.size}`);
       return true;
     } catch (error) {
       this.recordHandlerError(error, "SDK initialization");
@@ -180,6 +186,27 @@ class OpenSeaStream {
       this.scheduleClientRetry("sdk-init");
       return false;
     }
+  }
+
+  eventTypes() {
+    return [this.Types.ITEM_RECEIVED_BID, this.Types.COLLECTION_OFFER, this.Types.TRAIT_OFFER,
+      this.Types.ITEM_CANCELLED, this.Types.ORDER_INVALIDATE, this.Types.ORDER_REVALIDATE];
+  }
+
+  subscribeTopic(slug, generation = this.clientGeneration) {
+    if (!this.client || this.topicUnsubs.has(slug)) return;
+    this.topicUnsubs.set(slug, this.client.onEvents(slug, this.eventTypes(), event => this.handleSdkEvent(generation, event)));
+  }
+
+  /** Per-collection mode: add/remove topics on the live socket, no restart. */
+  syncTopics() {
+    if (!this.perCollection || !this.client) return;
+    for (const [slug, unsub] of [...this.topicUnsubs]) if (!this.collections.has(slug)) {
+      try { unsub(); } catch {}
+      this.topicUnsubs.delete(slug);
+      this.refusedTopics.delete(slug);
+    }
+    for (const slug of this.collections) this.subscribeTopic(slug);
   }
 
   onSocketOpen(socket, generation) {
@@ -246,6 +273,11 @@ class OpenSeaStream {
     this.stats.framesReceived++;
     this.stats.bytesReceived += Buffer.byteLength(raw);
     this.lastFrameAt = Date.now();
+    // The SDK parses every frame already; only control frames matter here.
+    if (!raw.includes("\"phx_")) {
+      this.lastFrameType = "event";
+      return;
+    }
     let frame;
     try { frame = JSON.parse(raw); } catch { return; }
     if (!Array.isArray(frame) || frame.length < 5) return;
@@ -260,6 +292,21 @@ class OpenSeaStream {
       const sent = this.heartbeatRefs.get(String(frame[1] || ""));
       if (sent) this.lastHeartbeatRttMs = this.lastHeartbeatAt - sent;
       this.heartbeatRefs.delete(String(frame[1] || ""));
+      return;
+    }
+    if (this.perCollection && type === "phx_reply" && topic.startsWith("collection:") && topic !== "collection:*") {
+      const slug = topic.slice("collection:".length);
+      const status = String(frame[4] && frame[4].status || "").toLowerCase();
+      if (status === "ok") {
+        this.refusedTopics.delete(slug);
+        if (!this.subscriptionActive) this.onGlobalSubscriptionReady();
+      } else {
+        this.stats.joinRefused++;
+        this.refusedTopics.add(slug);
+        this.lastError = safeText(JSON.stringify(frame[4] && frame[4].response || { status }));
+        logger.stream(`[STREAM] topic ${safeText(slug, 80)} refused${this.label} status=${safeText(status, 32)} detail=${this.lastError}`);
+        try { this.onTopicUnavailable(slug, Date.now(), "topic-join-refused"); } catch (error) { this.recordHandlerError(error, "topic refused hook"); }
+      }
       return;
     }
     if (type === "phx_reply" && topic === "collection:*") {
@@ -409,21 +456,14 @@ class OpenSeaStream {
     this.stats.matchedEvents++;
     this.recordRecent(true);
     const correlationId = `s${process.pid}-${++this.eventSequence}`;
-    const rx = { correlationId, event: eventName, collectionSlug: slug };
-    productionTrace.record("stream_rx", rx, { event: eventName, collection: slug });
     const decoded = decodeEvent({ event: eventName, topic: "collection:*", payload: event });
-    if (!decoded) {
-      productionTrace.record("stream_mapped", rx, { event: eventName, collection: slug, status: "decode-failed" });
-      return;
-    }
+    // Per-event trace rows are written by the engine only for events that touch
+    // a tracked NFT (1.25.31: per-event rows here wrote ~8 MB/min).
+    if (!decoded) return;
     decoded.correlationId = correlationId;
     decoded.collectionSlug = slug;
     decoded.receivedMono = receivedMono;
     decoded.decodedMono = Number(process.hrtime.bigint()) / 1e6;
-    productionTrace.record("stream_mapped", decoded, {
-      event: eventName, collection: slug, tokenId: decoded.tokenId,
-      status: decoded.nft && decoded.nft.contract && decoded.nft.tokenId ? "mapped" : "scope-event"
-    });
     try {
       this.onEvent(decoded);
     } catch (error) {
@@ -460,6 +500,7 @@ class OpenSeaStream {
   healthForCollection(slug) {
     const key = String(slug || "").trim().toLowerCase();
     if (!key || !this.trackedSlugs.has(key)) return "DISCONNECTED";
+    if (this.refusedTopics.has(key)) return "RECONNECTING";
     return this.health();
   }
 
@@ -535,7 +576,8 @@ class OpenSeaStream {
     }
     const socketConnected = Boolean(this.activeSocket && this.activeSocket.readyState === this.WebSocket.OPEN);
     return {
-      mode: "official-global",
+      mode: this.perCollection ? "official-collections" : "official-global",
+      refusedTopics: this.refusedTopics.size,
       connected: socketConnected,
       socketConnected,
       subscriptionsActive: this.subscriptionActive,
@@ -568,3 +610,139 @@ class OpenSeaStream {
 }
 
 module.exports = { OpenSeaStream, EVENT_TYPES, ORDER_BLIND_MS, ORDER_RESUME_EVENTS, eventSlug, safeText };
+
+/**
+ * Tracked collections spread over several official SDK sockets (1.25.31).
+ * Observed live, not a documented limit: one socket accepted 50 collection
+ * topics and refused the rest; two sockets accepted all 60. Shards hold at
+ * most SHARD_SIZE topics, a slug keeps its shard when others are added, and
+ * topics change incrementally on the live socket.
+ */
+class ShardedOpenSeaStream {
+  constructor(options = {}, dependencies = {}) {
+    this.options = options;
+    this.dependencies = dependencies;
+    this.shards = [];
+    this.started = false;
+  }
+
+  static get SHARD_SIZE() { return 40; }
+
+  normalize(slugs) {
+    return [...new Set((slugs || []).map(x => String(x || "").trim().toLowerCase()).filter(Boolean))];
+  }
+
+  start(slugs = []) {
+    this.started = true;
+    this.apply(slugs);
+  }
+
+  setCollections(slugs = []) {
+    if (!this.started) return;
+    this.apply(slugs);
+  }
+
+  apply(slugs) {
+    const want = new Set(this.normalize(slugs));
+    for (const shard of this.shards) {
+      for (const slug of [...shard.slugs]) if (!want.has(slug)) { shard.slugs.delete(slug); shard.dirty = true; }
+    }
+    const assigned = new Set(this.shards.flatMap(shard => [...shard.slugs]));
+    for (const slug of want) {
+      if (assigned.has(slug)) continue;
+      let shard = this.shards.find(x => x.slugs.size < ShardedOpenSeaStream.SHARD_SIZE);
+      if (!shard) {
+        shard = { slugs: new Set(), stream: null, dirty: true };
+        this.shards.push(shard);
+      }
+      shard.slugs.add(slug);
+      shard.dirty = true;
+    }
+    for (const shard of [...this.shards]) {
+      if (!shard.dirty) continue;
+      shard.dirty = false;
+      if (!shard.slugs.size) {
+        if (shard.stream) shard.stream.stop();
+        this.shards.splice(this.shards.indexOf(shard), 1);
+        continue;
+      }
+      if (!shard.stream) {
+        const index = this.shards.indexOf(shard);
+        shard.stream = new OpenSeaStream({ ...this.options, perCollection: true, label: ` shard=${index + 1}` }, this.dependencies);
+        shard.stream.start([...shard.slugs]);
+      } else {
+        shard.stream.setCollections([...shard.slugs]);
+      }
+    }
+  }
+
+  shardFor(slug) {
+    const key = String(slug || "").trim().toLowerCase();
+    return this.shards.find(shard => shard.slugs.has(key)) || null;
+  }
+
+  health() {
+    if (!this.started || !this.shards.length) return "DISCONNECTED";
+    const states = this.shards.map(shard => shard.stream ? shard.stream.health() : "DISCONNECTED");
+    if (states.every(h => h === "HEALTHY")) return "HEALTHY";
+    for (const h of ["FAILED", "DEGRADED", "RECONNECTING", "DISCONNECTED", "STALE"]) if (states.includes(h)) return h;
+    return states[0];
+  }
+
+  healthForCollection(slug) {
+    const shard = this.shardFor(slug);
+    return shard && shard.stream ? shard.stream.healthForCollection(slug) : "DISCONNECTED";
+  }
+
+  revalidate(why = "revalidate") {
+    return Promise.all(this.shards.map(shard => shard.stream ? shard.stream.revalidate(why) : { healthy: false }))
+      .then(list => ({ healthy: list.every(r => r && r.healthy), reconnected: false, why }));
+  }
+
+  forceReconnect(why = "forced") {
+    let any = false;
+    for (const shard of this.shards) if (shard.stream && shard.stream.forceReconnect(why)) any = true;
+    return any;
+  }
+
+  refreshKey() { for (const shard of this.shards) if (shard.stream) shard.stream.refreshKey(); }
+
+  stop() {
+    this.started = false;
+    for (const shard of this.shards) if (shard.stream) shard.stream.stop();
+    this.shards = [];
+  }
+
+  status() {
+    const list = this.shards.map(shard => shard.stream ? shard.stream.status() : null).filter(Boolean);
+    const sum = key => list.reduce((n, s) => n + (Number(s[key]) || 0), 0);
+    const connected = list.length > 0 && list.every(s => s.socketConnected);
+    const lastEventAgeMs = list.map(s => s.lastEventAgeMs).filter(x => x >= 0);
+    const matched60 = sum("matchedEvents60s");
+    return {
+      mode: "official-collections",
+      shards: list.length,
+      connected, socketConnected: connected,
+      subscriptionsActive: list.length > 0 && list.every(s => s.subscriptionsActive),
+      health: this.health(),
+      marketState: matched60 ? "MARKET_EVENTS_SEEN" : this.health() === "HEALTHY" ? "CONNECTED_NO_TRACKED_EVENT_IN_WINDOW" : this.health(),
+      lastError: (list.find(s => s.lastError) || {}).lastError || "",
+      collections: sum("collections"), tracked: sum("tracked"), refusedTopics: sum("refusedTopics"),
+      lastFrameAt: Math.max(0, ...list.map(s => s.lastFrameAt || 0)),
+      lastFrameType: (list[0] || {}).lastFrameType || "",
+      lastMarketplaceEventAt: Math.max(0, ...list.map(s => s.lastMarketplaceEventAt || 0)),
+      lastEventAgeMs: lastEventAgeMs.length ? Math.min(...lastEventAgeMs) : -1,
+      marketplaceEvents60s: sum("marketplaceEvents60s"), matchedEvents60s: matched60, untrackedEvents60s: sum("untrackedEvents60s"),
+      heartbeatRttMs: Math.max(-1, ...list.map(s => s.heartbeatRttMs)),
+      streamGapStartedAt: Math.min(...list.map(s => s.streamGapStartedAt || Infinity).concat([Infinity])) === Infinity ? 0
+        : Math.min(...list.map(s => s.streamGapStartedAt || Infinity)),
+      reconnect: sum("reconnect"), resubscribeCount: sum("resubscribeCount"), handlerErrors: sum("handlerErrors"),
+      transportErrors: sum("transportErrors"), joinRefused: sum("joinRefused"),
+      framesReceived: sum("framesReceived"), bytesReceived: sum("bytesReceived"), controlFrames: sum("controlFrames"),
+      marketplaceEvents: sum("marketplaceEvents"), matchedEvents: sum("matchedEvents"), untrackedEvents: sum("untrackedEvents"),
+      orderEventsBlind: list.some(s => s.orderEventsBlind)
+    };
+  }
+}
+
+module.exports.ShardedOpenSeaStream = ShardedOpenSeaStream;
