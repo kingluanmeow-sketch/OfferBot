@@ -440,5 +440,30 @@ function makeEngine() {
   engine.recovery.stop();
 }
 
+// One large collection must not monopolize the global Path B candidate queue.
+{
+  const { engine } = makeEngine();
+  for (let i = 0; i < 20; i++) {
+    const key = `ethereum:0x1111111111111111111111111111111111111111:large-${i}`;
+    engine.rows.set(key, { key, tokenId: `large-${i}`, contract: "0x1111111111111111111111111111111111111111",
+      collectionSlug: "alpha", running: true });
+  }
+  const dispatched = [];
+  engine.queueRead = row => { dispatched.push(row.collectionSlug); return true; };
+  const candidates = [...engine.rows.values()].filter(row => row.running);
+  OfferItemEngineV2.prototype.scheduleRecoveryRows.call(engine, candidates, "topic-gap");
+  if (engine.recoveryCandidateTimer) {
+    clearTimeout(engine.recoveryCandidateTimer);
+    engine.recoveryCandidateTimer = null;
+  }
+  engine.pumpRecoveryCandidate();
+  check("recovery candidate queue round-robins across affected collections", () => {
+    assert.equal(dispatched[0], "alpha");
+    assert.equal(dispatched[1], "beta", "the second collection must not wait for alpha's full row batch");
+  });
+  engine.stopRecoveryScheduling();
+  engine.recovery.stop();
+}
+
 process.stdout.write(`\n${passed}/${passed + failed} per-topic recovery checks passed\n`);
 process.exitCode = failed ? 1 : 0;

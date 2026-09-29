@@ -459,6 +459,9 @@ class OfferItemEngineV2 {
     this.pendingReads = new Map();
     /** One bounded, coalescing Path B candidate queue, keyed by tracked NFT. */
     this.recoveryCandidates = new Map();
+    /** Per-collection candidate FIFOs, drained round-robin for cross-topic fairness. */
+    this.recoveryCandidateQueues = new Map();
+    this.recoveryCandidateSlugOrder = [];
     this.recoveryCandidateTimer = null;
     this.recoverySweepActive = false;
     this.lastFullRecoveryAt = 0;
@@ -1481,8 +1484,17 @@ class OfferItemEngineV2 {
       // A pending read already owns this token. Keeping it out of B's staging
       // queue prevents a retry/reconnect tick from producing another REST read.
       if (this.pendingReads.has(row.key) || this.hydrating.has(row.key)) { deduped++; continue; }
-      if (!this.recoveryCandidates.has(row.key)) added++;
-      else deduped++;
+      if (!this.recoveryCandidates.has(row.key)) {
+        added++;
+        const slug = String(row.collectionSlug || `row:${row.key}`).toLowerCase();
+        let queue = this.recoveryCandidateQueues.get(slug);
+        if (!queue) {
+          queue = [];
+          this.recoveryCandidateQueues.set(slug, queue);
+          this.recoveryCandidateSlugOrder.push(slug);
+        }
+        queue.push(row.key);
+      } else deduped++;
       this.recoveryCandidates.set(row.key, { reason, authoritative: Boolean(authoritative) });
     }
     if (added) this.stats.recoveryCandidatesQueued = (this.stats.recoveryCandidatesQueued || 0) + added;
@@ -1501,13 +1513,29 @@ class OfferItemEngineV2 {
       this.stopRecoveryScheduling();
       return;
     }
-    const next = this.recoveryCandidates.entries().next();
-    if (next.done) {
+    let next = null;
+    while (this.recoveryCandidateSlugOrder.length && !next) {
+      const slug = this.recoveryCandidateSlugOrder.shift();
+      const queue = this.recoveryCandidateQueues.get(slug);
+      if (!queue) continue;
+      while (queue.length) {
+        const key = queue.shift();
+        const request = this.recoveryCandidates.get(key);
+        if (!request) continue;
+        this.recoveryCandidates.delete(key);
+        next = [key, request];
+        break;
+      }
+      if (queue.length) this.recoveryCandidateSlugOrder.push(slug);
+      else this.recoveryCandidateQueues.delete(slug);
+    }
+    if (!next) {
+      this.recoveryCandidateQueues.clear();
+      this.recoveryCandidateSlugOrder.length = 0;
       this.recoverySweepActive = false;
       return;
     }
-    const [key, request] = next.value;
-    this.recoveryCandidates.delete(key);
+    const [key, request] = next;
     const row = this.rows.get(key);
     if (row && row.running && !this.pendingReads.has(key) && !this.hydrating.has(key)) {
       this.queueRead(row, { reason: request.reason, authoritative: request.authoritative,
@@ -1528,6 +1556,8 @@ class OfferItemEngineV2 {
     if (this.recoveryCandidateTimer) clearTimeout(this.recoveryCandidateTimer);
     this.recoveryCandidateTimer = null;
     this.recoveryCandidates.clear();
+    this.recoveryCandidateQueues.clear();
+    this.recoveryCandidateSlugOrder.length = 0;
     this.recoverySweepActive = false;
   }
 
