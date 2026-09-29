@@ -1,6 +1,6 @@
 {
   "name": "opensea-offer-bot",
-  "version": "1.25.25",
+  "version": "1.25.26",
   "description": "OpenSea Offer Bot - Electron / Seaport 1.6 / OpenSea Stream API",
   "author": "OpenSea Offer Bot",
   "license": "UNLICENSED",
@@ -41,7 +41,7 @@
     "electronVersion": "33.4.11",
     "productName": "OpenSea Offer Bot",
     "directories": {
-      "output": "dist-build-1.25.25-fair-topic-recovery",
+      "output": "dist-build-1.25.26-stable-updater-blockmap",
       "buildResources": "assets"
     },
     "files": [
@@ -104,14 +104,15 @@
       "createStartMenuShortcut": true,
         "artifactName": "OpenSea-Offer-Bot-${version}-Setup.exe",
       "deleteAppDataOnUninstall": false,
-      "differentialPackage": false
+      "differentialPackage": true
     },
     "publish": [
       {
         "provider": "github",
         "owner": "kingluanmeow-sketch",
         "repo": "OfferBot",
-        "releaseType": "release"
+        "releaseType": "release",
+        "channel": "latest"
       }
     ]
   },

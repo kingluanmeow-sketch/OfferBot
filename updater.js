@@ -30,6 +30,10 @@
 
 const { autoUpdater } = require("electron-updater");
 const errors = require("./error-registry");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const crypto = require("crypto");
 
 /**
  * What the window is told.
@@ -62,15 +66,18 @@ class Updater {
   /**
    * @param {object} options
    * @param {string} options.currentVersion
+   * @param {string} [options.updateLockRoot] test-only lock location override
    * @param {(state:UpdateState)=>void} options.onState  pushed to the window
    * @param {(line:string)=>void} [options.onLog]        never receives a token
    */
-  constructor({ currentVersion, onState, onLog, onBeforeInstall }) {
+  constructor({ currentVersion, onState, onLog, onBeforeInstall, updateLockRoot }) {
     this.currentVersion = String(currentVersion || "");
     this.onState = typeof onState === "function" ? onState : () => {};
     this.onLog = typeof onLog === "function" ? onLog : () => {};
     /** Chủ app ghi snapshot ở đây, đồng bộ, ngay trước khi giao cho installer. */
     this.onBeforeInstall = typeof onBeforeInstall === "function" ? onBeforeInstall : () => {};
+    this.updateLockRoot = typeof updateLockRoot === "string" ? updateLockRoot : "";
+    this.updateLock = null;
 
     this.state = {
       phase: PHASE.IDLE,
@@ -85,6 +92,13 @@ class Updater {
 
     /** Nothing is downloaded until the user asks for it. */
     autoUpdater.autoDownload = false;
+    // GitHub Releases does not reliably retain the previous version's blockmap
+    // at the URL electron-updater expects. Always download the complete NSIS
+    // installer; keep generating/uploading blockmaps for release integrity.
+    autoUpdater.disableDifferentialDownload = true;
+    // Production builds belong to the stable channel. Never let a stable
+    // install follow a test tag simply because GitHub's release feed changed.
+    autoUpdater.allowPrerelease = false;
 
     /**
      * Installing on quit is deliberately OFF.
@@ -104,6 +118,73 @@ class Updater {
     };
 
     this.wire();
+  }
+
+  /**
+   * Only one process for a given installation may check, download, or install.
+   * Tool windows use separate profiles, so the lock is in shared appData and
+   * keyed by the installation directory rather than userData.
+   */
+  acquireUpdateLock() {
+    if (this.updateLock) return true;
+    let appData;
+    try { appData = this.updateLockRoot || require("electron").app.getPath("appData"); }
+    catch { appData = os.tmpdir(); }
+    const installPath = path.resolve(path.dirname(process.execPath)).toLowerCase();
+    const key = crypto.createHash("sha256").update(installPath).digest("hex").slice(0, 24);
+    const lockPath = path.join(appData, "OpenSea Offer Bot", "update-locks", `${key}.lock`);
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    const owner = { pid: process.pid, installPath };
+    try {
+      fs.mkdirSync(lockPath);
+      try {
+        fs.writeFileSync(path.join(lockPath, "owner.json"), JSON.stringify(owner), { flag: "wx" });
+      } catch (error) {
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        throw error;
+      }
+      this.updateLock = { lockPath, owner };
+      const release = () => this.releaseUpdateLock();
+      process.once("exit", release);
+      try { require("electron").app.once("before-quit", release); } catch { /* unit tests */ }
+      return true;
+    } catch (error) {
+      if (error.code !== "EEXIST") {
+        this.onLog(`[UPDATE] không lấy được quyền cập nhật · ${errors.redact(error.message || error)}`);
+        return false;
+      }
+    }
+
+    // Reclaim a lock left by a crashed process. EPERM means the owner exists
+    // but is inaccessible; preserve that lock instead of starting a rival.
+    try {
+      const previous = JSON.parse(fs.readFileSync(path.join(lockPath, "owner.json"), "utf8"));
+      let alive = false;
+      if (Number.isInteger(previous.pid) && previous.pid > 0) {
+        try { process.kill(previous.pid, 0); alive = true; }
+        catch (error) { alive = error.code === "EPERM"; }
+      }
+      if (!alive) {
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        return this.acquireUpdateLock();
+      }
+    } catch {
+      // An incomplete lock may be a concurrent creator. Leave it in place;
+      // a later user check can reclaim it once the owner record is readable.
+    }
+    return false;
+  }
+
+  releaseUpdateLock() {
+    const lock = this.updateLock;
+    if (!lock) return;
+    this.updateLock = null;
+    try {
+      const owner = JSON.parse(fs.readFileSync(path.join(lock.lockPath, "owner.json"), "utf8"));
+      if (owner.pid === lock.owner.pid && owner.installPath === lock.owner.installPath) {
+        fs.rmSync(lock.lockPath, { recursive: true, force: true });
+      }
+    } catch { /* a crashed/removed lock is already released */ }
   }
 
   /** @param {Partial<UpdateState>} patch */
@@ -188,6 +269,13 @@ class Updater {
 
   /** Ask GitHub whether anything newer exists. */
   async check() {
+    if (!this.acquireUpdateLock()) {
+      return this.set({
+        phase: PHASE.ERROR,
+        code: "E_UPDATE_INSTANCE_BUSY",
+        message: "Một cửa sổ OfferBot khác đang quản lý cập nhật. Hãy kiểm tra tại cửa sổ đó."
+      });
+    }
     try {
       this.set({ phase: PHASE.CHECKING, code: "", message: "Đang kiểm tra bản mới…" });
       await autoUpdater.checkForUpdates();
@@ -202,6 +290,13 @@ class Updater {
     if (this.state.phase !== PHASE.AVAILABLE &&
         this.state.phase !== PHASE.ERROR) {
       return this.state;
+    }
+    if (!this.acquireUpdateLock()) {
+      return this.set({
+        phase: PHASE.ERROR,
+        code: "E_UPDATE_INSTANCE_BUSY",
+        message: "Một cửa sổ OfferBot khác đang quản lý cập nhật. Hãy kiểm tra tại cửa sổ đó."
+      });
     }
     try {
       this.set({ phase: PHASE.DOWNLOADING, percent: 0, code: "", message: "Đang tải bản mới…" });

@@ -637,6 +637,18 @@ const ERRORS = {
     expectedBehavior: "Refuse and keep running.",
     relatedModules: ["updater.js"]
   },
+  E_UPDATE_INSTANCE_BUSY: {
+    code: "E_UPDATE_INSTANCE_BUSY",
+    title: "Cửa sổ khác đang cập nhật",
+    category: CATEGORY.API,
+    severity: SEVERITY.WARN,
+    retryable: true,
+    userMessage: "Một cửa sổ OfferBot khác đang quản lý cập nhật. Hãy kiểm tra tại cửa sổ đó.",
+    technicalMeaning: "A per-installation owner lock prevents parallel check, download, and installer runs.",
+    trigger: "A second Tool window requested an update while the owner was active.",
+    expectedBehavior: "Keep the update operation single-owner and direct the user to its window.",
+    relatedModules: ["updater.js"]
+  },
   E_UPDATE_FAILED: {
     code: "E_UPDATE_FAILED",
     title: "Cập nhật thất bại",

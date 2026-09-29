@@ -27,7 +27,7 @@ earlyApp.setPath("userData", PROFILE);
 process.env.LOCALAPPDATA = PROFILE;
 
 const errors = require(path.join(ROOT, "error-registry"));
-const { classifyUpdateError, autoUpdater } = require(path.join(ROOT, "updater"));
+const { Updater, classifyUpdateError, autoUpdater } = require(path.join(ROOT, "updater"));
 
 // Never let a test install anything.
 let installCalls = 0;
@@ -213,8 +213,9 @@ async function main() {
       !/SecretStore|secrets\.save|privateKey|apiKey/.test(src));
     check("updater không đụng vào settings",
       !/updateSettings|db\./.test(src));
-    check("updater không xoá gì cả",
-      !/rmSync|unlinkSync|rmdirSync/.test(src));
+    check("updater chỉ dọn khóa cạnh tranh của chính nó",
+      /rmSync\(lock\.lockPath/.test(src) &&
+      !/rmSync\([^\n]*(userData|settings|credential|secrets)/i.test(src));
 
     // The identity file itself, before and after an install request.
     const deviceDir = path.join(PROFILE, "OpenSea Offer Bot");
@@ -284,6 +285,12 @@ async function main() {
     const publish = pkg.build.publish;
 
     check("có cấu hình nguồn cập nhật", Array.isArray(publish) && publish.length === 1);
+    check("release stable dùng releaseType=release và channel=latest",
+      publish[0].releaseType === "release" && publish[0].channel === "latest",
+      JSON.stringify({ releaseType: publish[0].releaseType, channel: publish[0].channel }));
+    check("build sinh blockmap cho installer Windows",
+      pkg.build.nsis.differentialPackage === true,
+      String(pkg.build.nsis.differentialPackage));
     check("trỏ đúng repository",
       publish[0].owner === "kingluanmeow-sketch" && publish[0].repo === "OfferBot",
       JSON.stringify(publish[0]));
@@ -383,6 +390,11 @@ async function main() {
     check("không tự cài khi thoát app",
       autoUpdater.autoInstallOnAppQuit === false,
       String(autoUpdater.autoInstallOnAppQuit));
+    check("stable build không theo prerelease", autoUpdater.allowPrerelease === false,
+      String(autoUpdater.allowPrerelease));
+    check("download luôn dùng installer đầy đủ trên GitHub",
+      autoUpdater.disableDifferentialDownload === true,
+      String(autoUpdater.disableDifferentialDownload));
 
     const src = fs.readFileSync(path.join(ROOT, "updater.js"), "utf8");
     check("KHÔNG tắt kiểm tra chữ ký",
@@ -391,6 +403,29 @@ async function main() {
       "một update không kiểm chữ ký là một đường cài mã tuỳ ý");
     check("và không cho phép hạ cấp phiên bản",
       !/allowDowngrade\s*=\s*true/.test(src));
+  }
+
+  // ================================================================
+  say("\n--- 12: một updater owner cho mỗi installation ---");
+  // ================================================================
+  {
+    const options = { currentVersion: app.getVersion(), onState: () => {}, onLog: () => {}, updateLockRoot: PROFILE };
+    const first = new Updater(options);
+    const second = new Updater(options);
+    check("process đầu lấy được quyền update", first.acquireUpdateLock());
+    check("process cạnh tranh không thể lấy cùng quyền", !second.acquireUpdateLock());
+    first.releaseUpdateLock();
+    check("quyền được nhả khi owner kết thúc", second.acquireUpdateLock());
+    second.releaseUpdateLock();
+
+    const realCheck = autoUpdater.checkForUpdates;
+    autoUpdater.checkForUpdates = async () => { throw new Error("getaddrinfo ENOTFOUND github.com"); };
+    const failedCheck = new Updater(options);
+    const state = await failedCheck.check();
+    check("lỗi check không bị coi là NO_UPDATE", state.phase === "ERROR" && state.code === "E_UPDATE_NETWORK",
+      JSON.stringify({ phase: state.phase, code: state.code }));
+    failedCheck.releaseUpdateLock();
+    autoUpdater.checkForUpdates = realCheck;
   }
 }
 
