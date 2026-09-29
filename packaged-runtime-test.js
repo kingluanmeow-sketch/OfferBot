@@ -49,6 +49,9 @@ function checkArchiveGraph() {
   for (const entry of ["main.js", "opensea.js", "offer-item-v2/engine-v2.js", "preload.js", "renderer/index.html"]) {
     check(`app.asar contains ${entry}`, files.has(entry));
   }
+  check("packaged archive includes the official Stream SDK adapter",
+    files.has("stream-sdk.js") && files.has("node_modules/@opensea/sdk/lib/stream/index.js") &&
+      files.has("node_modules/ws/index.js"));
 
   const missing = [];
   const queued = ["main.js", "preload.js", "wallet-preload.js"]
@@ -219,7 +222,7 @@ async function checkPackagedAppBoot() {
     const fatal = output.split(/\r?\n/).filter(line =>
       /Uncaught Exception|Cannot find module|JavaScript error/i.test(line));
     check("packaged Windows app opens its main renderer", Boolean(page),
-      fatal.join(" | ") || `exit=${child.exitCode}`);
+      fatal.join(" | ") || `exit=${child.exitCode}; output=${output.slice(-3000)}`);
     check("no missing-module or uncaught main-process exception", fatal.length === 0,
       fatal.join(" | "));
     if (!page) return;
@@ -261,16 +264,17 @@ async function checkPackagedAppBoot() {
       const runtime = await cdp.send("Runtime.evaluate", {
         expression: `window.botAPI.getState().then(s => ({
           hasStream: Boolean(s && s.stream),
-          mode: s && s.stream && s.stream.global && s.stream.global.mode,
-          tracked: s && s.stream && s.stream.global && s.stream.global.tracked,
-          joined: s && s.stream && s.stream.joined
+          mode: s && s.stream && s.stream.mode,
+          tracked: s && s.stream && s.stream.tracked,
+          subscriptionsActive: s && s.stream && s.stream.subscriptionsActive,
+          marketplaceEvents60s: s && s.stream && s.stream.marketplaceEvents60s
         }))`,
         awaitPromise: true,
         returnByValue: true
       });
       const streamState = runtime.result.value || {};
-      check("packaged Stream subsystem initializes in per-collection mode",
-        streamState.hasStream && streamState.mode === "per-collection",
+      check("packaged Stream subsystem initializes with official global SDK mode",
+        streamState.hasStream && streamState.mode === "official-global",
         JSON.stringify(streamState));
       const uiDelta = await cdp.send("Runtime.evaluate", {
         expression: `(() => {

@@ -1,6 +1,6 @@
 {
   "name": "opensea-offer-bot",
-  "version": "1.25.26",
+  "version": "1.25.27",
   "description": "OpenSea Offer Bot - Electron / Seaport 1.6 / OpenSea Stream API",
   "author": "OpenSea Offer Bot",
   "license": "UNLICENSED",
@@ -21,16 +21,18 @@
     "manager:test": "node manager-test.js",
     "release:publish": "node publish-release.js",
     "test:packaged-runtime": "node packaged-runtime-test.js",
-    "test:stream-ab": "node stream-ab-architecture-test.js && node offer-item-v2-ab-selfcancel-test.js",
+    "test:stream-ab": "node stream-sdk-test.js && node stream-ab-architecture-test.js && node offer-item-v2-ab-selfcancel-test.js",
     "test:numeric-trait-offers": "node numeric-trait-offer-test.js",
     "benchmark:stream-ab": "node stream-global-vs-tracked-benchmark.js",
     "test:all": "node scripts-check.js && node run-all-tests.js",
     "license:backup": "node backup-license-data.js"
   },
   "dependencies": {
+    "@opensea/sdk": "12.10.2",
     "axios": "^1.7.9",
     "electron-updater": "^6.8.9",
-    "ethers": "^6.15.0"
+    "ethers": "^6.15.0",
+    "ws": "8.21.0"
   },
   "devDependencies": {
     "electron": "^33.2.1",
@@ -41,7 +43,7 @@
     "electronVersion": "33.4.11",
     "productName": "OpenSea Offer Bot",
     "directories": {
-      "output": "dist-build-1.25.26-stable-updater-blockmap",
+      "output": "dist-build-1.25.27-official-stream",
       "buildResources": "assets"
     },
     "files": [
@@ -62,6 +64,7 @@
       "wallet.js",
       "wallet-preload.js",
       "stream.js",
+      "stream-sdk.js",
       "rate-limiter.js",
       "read-dispatcher.js",
       "single-flight.js",
@@ -102,7 +105,7 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-        "artifactName": "OpenSea-Offer-Bot-${version}-Setup.exe",
+      "artifactName": "OfferBot-v${version}-Setup.exe",
       "deleteAppDataOnUninstall": false,
       "differentialPackage": true
     },

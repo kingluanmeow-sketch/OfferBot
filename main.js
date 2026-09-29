@@ -73,7 +73,7 @@ const linkList = require("./link-list");
 const { profiler } = require("./latency");
 const browser = require("./browser");
 const wallet = require("./wallet");
-const { OpenSeaStream } = require("./stream");
+const { OpenSeaStream } = require("./stream-sdk");
 /**
  * ENGINE OFFER ITEM CŨ KHÔNG CÒN TRONG SẢN PHẨM
  *
@@ -899,7 +899,7 @@ function installPowerHooks() {
    *   đọc REST cho mọi hàng. Nay: gửi một heartbeat và chờ phản hồi ngắn.
    *   Socket trả lời → giữ nguyên, không đọc lại gì. Không trả lời / không
    *   còn socket → đóng qua đường thường; socket mới mở ra sẽ báo engines
-   *   ĐÚNG MỘT LẦN (OpenSeaStream.handleOpen → onReconnect).
+   *   ĐÚNG MỘT LẦN, sau khi official SDK nhận ACK global subscription.
    */
   const revalidate = why => {
     if (!stream || typeof stream.revalidate !== "function") return;
@@ -965,9 +965,8 @@ function startStream() {
     // Thêm Key 2 không nối lại Stream đang khoẻ: chỉ khi key ĐANG DÙNG bị gỡ/thay.
     isKeyConfigured: key => Boolean(rateLimiter.apiKeys.find(key)),
 
-    // A live socket was lost and a replacement is now open (fired once per
-    // gap, not per backoff attempt). Engines note it; Path B runs per-topic
-    // after each collection's join ACK, avoiding a duplicate global sweep.
+    // The official SDK restored the global subscription after a transport gap.
+    // Engines note the reconnect; scoped collection repairs follow the global ACK.
     onReconnect: () => {
       for (const engine of engines.values()) {
         try {
@@ -978,8 +977,8 @@ function startStream() {
       }
     },
 
-    // One collection channel was closed/errored by the server (protocol
-    // evidence) and has been rejoined: engines re-check that collection once.
+    // Global subscription is active again; reconcile only this affected
+    // collection so REST remains a bounded recovery path.
     onTopicGap: slug => {
       for (const engine of engines.values()) {
         try { if (typeof engine.onTopicGap === "function") engine.onTopicGap(slug); }
@@ -987,8 +986,8 @@ function startStream() {
       }
     },
 
-    // A previously joined topic failed. Begin targeted recovery at the outage
-    // edge so P0 cannot be left as an ownerless SEND until the next join ACK.
+    // The global Stream lost authority. Mark each affected collection at the
+    // outage edge so stale Best cannot authorize a SEND during recovery.
     onTopicUnavailable: (slug, at, reason) => {
       for (const engine of engines.values()) {
         try { if (typeof engine.onTopicUnavailable === "function") engine.onTopicUnavailable(slug, at, reason); }
@@ -996,8 +995,8 @@ function startStream() {
       }
     },
 
-    // First join ACK of a collection topic (1.25.12): rows read BEFORE it may
-    // have missed events in between; each engine re-reads only those rows.
+    // First global ACK: rows read BEFORE it may have missed events between the
+    // authority snapshot and Stream readiness; each engine re-reads only those rows.
     onTopicJoined: (slug, joinedAt) => {
       for (const engine of engines.values()) {
         try { if (typeof engine.onTopicJoined === "function") engine.onTopicJoined(slug, joinedAt); }
@@ -1367,10 +1366,15 @@ function startHousekeeping() {
       const ses = openseaSession.stats();
       const cur = {
         apiRead: reads, metadata: opensea.metaStats.calls, gql: 0,
-        streamEvents: st.events || 0, reconnect: st.reconnects || 0, topicRejoin: st.topicRejoins || 0,
+        streamEvents: st.marketplaceEvents || st.events || 0,
+        reconnect: st.reconnect || st.reconnects || 0,
+        topicRejoin: st.resubscribeCount || st.topicRejoins || 0,
         streamFrames: st.framesReceived || 0, streamBytes: st.bytesReceived || 0,
-        streamHandled: st.handled || 0,
-        streamDropped: (st.untrackedDropped || 0) + (st.eventTypeDropped || 0),
+        streamControlFrames: st.controlFrames || 0,
+        streamMarketplaceFrames: st.marketplaceEvents || st.events || 0,
+        streamUnclassifiedFrames: st.untrackedEvents || st.untrackedDropped || 0,
+        streamHandled: st.matchedEvents || st.handled || 0,
+        streamDropped: st.untrackedEvents || st.untrackedDropped || 0,
         joinRefused: st.joinRefused || 0, webNav: wk.navigations, profileNav: wk.profileNavigations,
         profileReads: ses.profileReads, workerCreated: wk.created, workerIdle: wk.destroyedIdle
       };
@@ -1422,9 +1426,11 @@ function startHousekeeping() {
           `${n.stream.degraded ? " DEGRADED" : ""} · total write=${(n.total || {}).write || 0} 429=${(n.total || {})["429"] || 0}`);
       }
       const planeActivity = d.apiRead + d.metadata + d.gql + d.webNav + d.profileReads + d.reconnect + d.topicRejoin + d.joinRefused + d.workerCreated;
-      if (!planeActivity && !engineActivity) return;
+      if (!planeActivity && !engineActivity && st.mode !== "official-global") return;
       const subs = st.subscriptions ? ` subs joined=${st.subscriptions.JOINED || 0} joining=${st.subscriptions.JOINING || 0} backoff=${st.subscriptions.BACKOFF || 0}` : "";
-      const gl = st.global ? ` feed=${st.global.mode} tracked=${st.global.tracked} rx=${d.streamFrames} handled=${d.streamHandled} dropped=${d.streamDropped} bytes=${d.streamBytes}` : "";
+      const gl = st.mode === "official-global"
+        ? ` STREAM connected=${Boolean(st.socketConnected)} active=${Boolean(st.subscriptionsActive)} mode=${st.mode} state=${st.marketState || st.health} marketplaceEvents60s=${st.marketplaceEvents60s || 0} matched60s=${st.matchedEvents60s || 0} untracked60s=${st.untrackedEvents60s || 0} lastEventAgeMs=${st.lastEventAgeMs ?? -1} reconnect=${st.reconnect || 0} handlerErrors=${st.handlerErrors || 0} gap=${st.streamGapStartedAt || 0} rxFrames=${d.streamFrames} controlFrames=${d.streamControlFrames} lastFrame=${st.lastFrameType || "-"}`
+        : st.global ? ` feed=${st.global.mode} tracked=${st.global.tracked} rx=${d.streamFrames}(ctrl=${d.streamControlFrames} market=${d.streamMarketplaceFrames} other=${d.streamUnclassifiedFrames}) handled=${d.streamHandled} dropped=${d.streamDropped} bytes=${d.streamBytes} lastFrame=${st.lastFrameType || "-"} joinReply=${st.lastJoinReplyStatus || "-"}:${st.lastJoinReplyTopic || "-"}` : "";
       logger.engine(`[NET] 60s · streamEvents=${d.streamEvents} reconnect=${d.reconnect} rejoin=${d.topicRejoin} joinRefused=${d.joinRefused} · ` +
         `apiRead=${d.apiRead} metadata=${d.metadata} gql=${d.gql} · webNav=${d.webNav} profileNav=${d.profileNav} profileReads=${d.profileReads} ` +
         `worker +${d.workerCreated}/-${d.workerIdle} (${wk.alive ? "alive" : "off"})${subs}${gl} | ` + parts.join(" | "));
