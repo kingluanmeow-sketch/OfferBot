@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-build-*/
+.work/
+.env
+.env.*
+*.log
+*.db
+*.sqlite
+*.sqlite3
+license-signing-key.SECRET.json
+release-artifacts/
+.DS_Store
+Thumbs.db

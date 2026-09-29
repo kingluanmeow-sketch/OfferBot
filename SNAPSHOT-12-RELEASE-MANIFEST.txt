@@ -1,0 +1,16 @@
+OfferBot controlled pre-release source archive
+Release tag: v1.25.18-test.3
+Runtime candidate: OpenSea-Offer-Bot-1.25.13-snapshot-12.exe
+EXE size: 75960198 bytes
+EXE SHA256: 96C55390E585662CF53C812097FB7B463D5962924E03789519C282533951EB48
+app.asar SHA256: 6E27B57DFB8D15F024B500205CA38C2316DF13064A8D869CB999FCFF9FCA623D
+Root cause: Snapshot 11 build.files omitted the shared definitive-offer-rejection classifier required at seaport.js startup.
+Fix: seaport.js now imports the isolated Offer Item primitive from offer-item-outcomes.js; only that primitive is packaged. SLL/Cancel/Bulk feature modules remain excluded.
+Changed source files: package.json, seaport.js, new offer-item-outcomes.js, new packaged-runtime-test.js. test-exe-sandbox.js is included to sandbox the packaged boot test.
+RED: Snapshot 11 app.asar dependency test failed with Cannot find module './offer-sll-outcomes'.
+GREEN: Snapshot 12 package dependency closure and startup/UI/Add NFT test passed 15/15.
+Realtime: targeted priority test passed 26/26; Stream event to HTTP start p95 2.71 ms.
+Stress: targeted stress test passed 16/16.
+Windows Authenticode: NotSigned.
+Production OpenSea: NOT YET VERIFIED. 24/7 reliability: NOT YET PROVEN.
+The stable latest.yml and stable auto-update target are unchanged.

@@ -1,0 +1,122 @@
+{
+  "name": "opensea-offer-bot",
+  "version": "1.25.22",
+  "description": "OpenSea Offer Bot - Electron / Seaport 1.6 / OpenSea Stream API",
+  "author": "OpenSea Offer Bot",
+  "license": "UNLICENSED",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win",
+    "check": "node scripts-check.js",
+    "smoke": "electron smoke-test.js",
+    "license": "node make-license.js",
+    "license:server": "node license-server/server.js",
+    "license:admin": "node license-server/admin.js",
+    "release:verify": "electron verify-release.js",
+    "publish": "electron-builder --win --publish always",
+    "publish:dry": "electron-builder --win --publish never",
+    "manager": "electron manager/main.js",
+    "manager:build": "electron-builder --win --config manager/builder.json",
+    "manager:test": "node manager-test.js",
+    "release:publish": "node publish-release.js",
+    "test:packaged-runtime": "node packaged-runtime-test.js",
+    "test:stream-ab": "node stream-ab-architecture-test.js && node offer-item-v2-ab-selfcancel-test.js",
+    "test:numeric-trait-offers": "node numeric-trait-offer-test.js",
+    "benchmark:stream-ab": "node stream-global-vs-tracked-benchmark.js",
+    "test:all": "node scripts-check.js && node run-all-tests.js",
+    "license:backup": "node backup-license-data.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "electron-updater": "^6.8.9",
+    "ethers": "^6.15.0"
+  },
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "com.openseaofferbot.app",
+    "electronVersion": "33.4.11",
+    "productName": "OpenSea Offer Bot",
+    "directories": {
+      "output": "dist-build-1.25.22-topic-recovery",
+      "buildResources": "assets"
+    },
+    "files": [
+      "main.js",
+      "profile-guard.js",
+      "preload.js",
+      "db.js",
+      "secret-store.js",
+      "wallet-profiles.js",
+      "offer-item-v2/**/*",
+      "nft-source.js",
+      "standard-store.js",
+      "dev-runtime.js",
+      "link-list.js",
+      "add-batch-gate.js",
+      "opensea.js",
+      "browser.js",
+      "wallet.js",
+      "wallet-preload.js",
+      "stream.js",
+      "rate-limiter.js",
+      "read-dispatcher.js",
+      "single-flight.js",
+      "remote-host.js",
+      "cache.js",
+      "logger.js",
+      "license.js",
+      "error-registry.js",
+      "updater.js",
+      "license-client.js",
+      "trusted-time.js",
+      "latency.js",
+      "session.js",
+      "instance.js",
+      "renderer/**/*",
+      "!renderer/sll-layout.js",
+      "!renderer/cancel.js",
+      "!renderer/bulk-offer.js",
+      "assets/**/*",
+      "package.json",
+      "!license-signing-key.SECRET.json",
+      "!license-server",
+      "!license-server/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+        "artifactName": "OpenSea-Offer-Bot-${version}-Setup.exe",
+      "deleteAppDataOnUninstall": false,
+      "differentialPackage": false
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "kingluanmeow-sketch",
+        "repo": "OfferBot",
+        "releaseType": "release"
+      }
+    ]
+  },
+  "osb": {
+    "unsignedReleaseAccepted": true,
+    "diagnosticBuild": false
+  }
+}

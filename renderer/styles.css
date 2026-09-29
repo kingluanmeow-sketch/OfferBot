@@ -1,0 +1,3220 @@
+/* ==================================================================
+   OpenSea Offer Bot - renderer styles
+
+   One stylesheet for both dashboards. Ethereum and Robinhood share every
+   class, so column widths, input sizes, button sizes, spacing and fonts are
+   identical by construction (spec 3).
+
+   Spec 21: a disabled button uses cursor:default. `cursor: wait` is never
+   used anywhere in this file - it makes the Windows cursor spin.
+   ================================================================== */
+
+:root {
+  --bg: #0f1115;
+  --bg-panel: #171a21;
+  --bg-elevated: #1e222b;
+  --border: #2a2f3a;
+  --text: #e6e9ef;
+  --text-dim: #9aa3b2;
+
+  --accent: #4c8dff;
+  --blue: #3b82f6;
+  --green: #22c55e;
+  --yellow: #eab308;
+  --red: #ef4444;
+  --grey: #8b93a3;
+
+  /*
+   * Tall enough for the STATE cell's own content (badge ~20px + gap + a stage
+   * line ~15px + gap + the 4px live bar ≈ 45px, plus its 8px top/bottom
+   * padding ≈ 53px) — every row carries that same cell, so anything shorter
+   * than its real content forces the browser to grow just that row past the
+   * declared height while simpler cells (Min/Max/Step, Best/Mine) stay at
+   * their natural size and float centered in the taller box: the reported
+   * "row lệch" (cells across a row not level with each other). One value
+   * here, referenced everywhere a row height is needed (§20: not another
+   * override stacked on top).
+   */
+  --row-h: 56px;
+  --radius: 8px;
+  --font: "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+
+  /* Status chips: readable text on a tinted chip, per theme. */
+  --chip-blue: #bfdbfe;
+  --chip-green: #bbf7d0;
+  --chip-yellow: #fde68a;
+  --chip-orange: #fed7aa;
+  --chip-red: #fecaca;
+  --chip-grey: #d5d9e2;
+
+  /* Surfaces that were literal near-blacks. */
+  --surface-sunken: #0b0d11;
+  --row-hover: #1b1f28;
+  --row-invalid: #2a1a1a;
+
+  /* ---- aliases that USED to be fallbacks -------------------------
+
+     Eight names were being referenced as var(--x, #hardcoded) without ever
+     being defined, so every one of them silently resolved to its fallback.
+     Two of those fallbacks were opaque near-blacks - --panel on the
+     confirmation card and --panel-2 on the bulk progress bar - which is how
+     the light theme ended up painting dark boxes under dark text.
+
+     Defined here and in the light block, so nothing depends on a fallback
+     and both themes are decided in one place. */
+  --panel: var(--bg-panel);
+  --panel-2: var(--bg-elevated);
+  --surface-2: rgba(255, 255, 255, 0.06);
+  --accent-soft: rgba(76, 141, 255, 0.18);
+  --danger: var(--red);
+  --ok: var(--green);
+  --good: var(--green);
+  --bad: var(--red);
+}
+
+/* v1.19.22 compact workspace: keep the NFT table dominant like the reference
+   layout while retaining the existing theme tokens and behavior. */
+.topbar { padding: 6px 14px; gap: 12px; min-height: 42px; }
+.content { padding: 10px 14px 12px; }
+.panel { padding: 12px; margin-bottom: 10px; }
+.panel-title { margin-bottom: 8px; }
+.add-panel { padding-bottom: 10px; }
+.toolbar { padding: 10px 12px; }
+.toolbar-row { gap: 7px; }
+.config-grid { gap: 8px; }
+.table-wrap { position: relative; }
+.table-head { display:flex; align-items:center; justify-content:space-between; gap:10px; padding: 7px 10px; min-height: 34px; border-bottom: 1px solid var(--border); }
+.table-title { font-size: 15px; font-weight: 650; }
+.table-head .nft-search { width: min(380px, 42vw); margin-left:auto; }
+.one-row-scroll { right: 3px; top: 46px; bottom: 8px; }
+
+/* Light theme.
+
+   Only the palette changes: every rule in this file reads these variables, so
+   redefining them re-themes the sidebar, tabs, cards, inputs, buttons,
+   textareas, counters, progress bars, result cards, dialogs and toasts at once.
+   Nothing below needs to know which theme is active. */
+:root[data-theme="light"] {
+  --bg: #f5f6f8;
+  --bg-panel: #ffffff;
+  --bg-elevated: #eef0f4;
+  --border: #d6dae1;
+  --text: #0b0d10;
+  --text-dim: #4a5260;
+
+  --accent: #2563eb;
+  --blue: #2563eb;
+  --green: #15803d;
+  --yellow: #a16207;
+  --red: #dc2626;
+  --grey: #6b7280;
+
+  /* Dark enough to read on a tinted chip over a light ground; the pale dark
+     theme values are invisible there. */
+  --chip-blue: #1e40af;
+  --chip-green: #14532d;
+  --chip-yellow: #713f12;
+  --chip-orange: #7c2d12;
+  --chip-red: #7f1d1d;
+  --chip-grey: #374151;
+
+  --surface-sunken: #f0f2f5;
+  --row-hover: #eceff3;
+  --row-invalid: #fdeaea;
+
+  /* The same eight, resolved for a light ground. */
+  --panel: var(--bg-panel);
+  --panel-2: var(--bg-elevated);
+  --surface-2: rgba(0, 0, 0, 0.05);
+  --accent-soft: rgba(37, 99, 235, 0.14);
+  --danger: var(--red);
+  --ok: var(--green);
+  --good: var(--green);
+  --bad: var(--red);
+}
+
+/* The progress bar paints its own track rather than reading a variable. */
+:root[data-theme="light"] .progress-track {
+  background: rgba(0, 0, 0, 0.08);
+}
+
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 13px;
+  overflow: hidden;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* ---------------- top bar ---------------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 16px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.brand {
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+
+.tabbar {
+  display: flex;
+  gap: 6px;
+  flex: 1 1 auto;
+}
+
+.tab {
+  padding: 7px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.tab:hover {
+  color: var(--text);
+  border-color: #3a4150;
+}
+
+.tab-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.statusbar {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  /* Co lại được thay vì đẩy thanh tiêu đề xuống dòng thứ hai. Một dòng
+     trạng thái dài hơn từng làm cả tab Offer SLL cao thêm một hàng và bắt
+     đầu cuộn — thứ mà cả bố cục này sinh ra để không xảy ra. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------------- content ---------------- */
+
+.content {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 16px;
+}
+
+.panel-page {
+  display: none;
+}
+
+.dash-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.dash-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  /* Named rather than inherited: unset, this measured 1.18:1 on a light
+     ground - a page heading that was very nearly invisible. */
+  color: var(--text);
+}
+
+/* ---------------- counters (spec 7) ---------------- */
+
+.counters {
+  display: flex;
+  gap: 10px;
+}
+
+.counter {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 118px;
+  padding: 8px 12px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.counter-label {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.counter b {
+  font-size: 16px;
+  margin-left: auto;
+}
+
+.c-active b {
+  color: var(--blue);
+}
+.c-ontop b {
+  color: var(--green);
+}
+.c-outbid b {
+  color: var(--yellow);
+}
+
+/* ---------------- panels ---------------- */
+
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-bottom: 14px;
+}
+
+.panel-title {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+}
+
+.hint {
+  margin: 10px 0 0;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.info-line {
+  margin-top: 8px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+/* ---------------- inputs ---------------- */
+
+.links-input {
+  width: 100%;
+  min-height: 74px;
+  resize: vertical;
+  padding: 9px 11px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.config-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: flex-end;
+  margin-top: 10px;
+}
+
+.config-grid-wide .field {
+  min-width: 260px;
+  flex: 1 1 260px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.field-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.field-check {
+  justify-content: flex-end;
+}
+
+.field-action {
+  justify-content: flex-end;
+}
+
+/* Fixed input sizes: both dashboards get the exact same metrics. */
+.num-input,
+.text-input,
+.select-input,
+.wallet-profile-select {
+  height: 32px;
+  width: 118px;
+  padding: 0 9px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+/*
+ * No spinner arrows on number fields.
+ *
+ * The prices here are typed, not nudged: the arrows step by whole units, which
+ * is useless next to a value like 0.0001, and they eat width from an already
+ * narrow field. Chromium needs both the pseudo-element and the property.
+ */
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+}
+
+.text-input {
+  width: 100%;
+}
+
+.select-input {
+  width: 160px;
+}
+
+.num-input:focus,
+.text-input:focus,
+.links-input:focus,
+.select-input:focus,
+.wallet-profile-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin: 0;
+}
+
+.form-error {
+  margin-top: 8px;
+  min-height: 0;
+  font-size: 12px;
+  color: var(--yellow);
+  display: none;
+}
+
+.form-error.visible {
+  display: block;
+}
+
+.form-error.is-error {
+  color: var(--red);
+}
+
+/* ---------------- buttons ---------------- */
+
+.btn {
+  height: 34px;
+  min-width: 116px;
+  padding: 0 16px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: #3f4756;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.btn-start {
+  background: #16803c;
+  border-color: #16803c;
+  color: #fff;
+}
+
+.btn-pause {
+  background: #8a6100;
+  border-color: #8a6100;
+  color: #fff;
+}
+
+.btn-stop {
+  background: #5b3030;
+  border-color: #5b3030;
+  color: #fff;
+}
+
+.btn-danger {
+  background: #7f1d1d;
+  border-color: #7f1d1d;
+  color: #fff;
+}
+
+/* Spec 21: disabled must NOT spin the Windows cursor. */
+.btn:disabled,
+.icon-btn:disabled,
+button:disabled {
+  opacity: 0.42;
+  cursor: default;
+}
+
+.toolbar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.selection-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.batch-label {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+.toolbar-hint {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.icon-btn {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.icon-start:not(:disabled) {
+  color: var(--green);
+}
+.icon-pause:not(:disabled) {
+  color: var(--yellow);
+}
+.icon-delete:not(:disabled) {
+  color: var(--red);
+}
+
+/* ---------------- table (spec 4) ---------------- */
+
+.table-wrap {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: auto;
+  background: var(--bg-panel);
+}
+
+.nft-search {
+  min-width: 210px;
+  margin-left: auto;
+}
+
+.save-toggle.is-on {
+  color: #fff;
+  border-color: var(--green, #2fbf71);
+  background: rgba(47, 191, 113, 0.2);
+}
+
+.one-row-scroll {
+  position: sticky;
+  z-index: 8;
+  right: 6px;
+  bottom: 6px;
+  float: right;
+  display: grid;
+  gap: 3px;
+}
+
+.one-row-scroll button {
+  width: 32px;
+  height: 28px;
+  border: 1px solid var(--border, #48505f);
+  border-radius: 6px;
+  background: var(--panel, #20252d);
+  color: inherit;
+  cursor: pointer;
+}
+
+.nft-table,
+.cancel-table {
+  /* Fixed layout so every column keeps its declared width and the table never
+     reflows when a price string gets longer. */
+  table-layout: fixed;
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.nft-table th,
+.cancel-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  height: 38px;
+  padding: 0 8px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.nft-table td,
+.cancel-table td {
+  height: var(--row-h);
+  padding: 0 8px;
+  border-bottom: 1px solid #232733;
+  vertical-align: middle;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nft-table tbody tr:hover {
+  background: var(--row-hover);
+}
+
+.row-invalid {
+  background: var(--row-invalid) !important;
+}
+
+.row-invalid .row-input {
+  border-color: var(--red);
+}
+
+.empty-row td {
+  text-align: center;
+  color: var(--text-dim);
+  height: 68px;
+}
+
+.cell-select,
+.cell-priority,
+.cell-btn {
+  text-align: center;
+}
+
+.nft-name {
+  font-weight: 600;
+}
+
+.nft-sub {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.cell-price {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.cell-pending {
+  color: var(--yellow);
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+/* ---------------- scan status (spec 5) ---------------- */
+
+.scan,
+.status {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* SCANNING - blue */
+.scan-scanning {
+  color: var(--chip-blue);
+  background: rgba(59, 130, 246, 0.16);
+}
+
+/* SEND OFFER - green */
+.scan-send {
+  color: var(--chip-green);
+  background: rgba(34, 197, 94, 0.18);
+}
+
+/* NEXT SCAN - yellow */
+.scan-next {
+  color: var(--chip-yellow);
+  background: rgba(234, 179, 8, 0.16);
+}
+
+.scan-stopped,
+.scan-error {
+  color: var(--chip-red);
+  background: rgba(239, 68, 68, 0.16);
+}
+
+/* ---------------- status (spec 6) ---------------- */
+
+.status-ontop {
+  color: var(--chip-green);
+  background: rgba(34, 197, 94, 0.18);
+}
+
+.status-active {
+  color: var(--chip-blue);
+  background: rgba(59, 130, 246, 0.16);
+}
+
+/* OUTBID is red: the price to beat is above Max and the bot is NOT following.
+   Yellow read as "in progress"; it is the opposite. */
+.status-outbid {
+  color: var(--chip-red);
+  background: rgba(239, 68, 68, 0.16);
+}
+
+.status-sendfail {
+  color: var(--chip-orange);
+  background: rgba(249, 115, 22, 0.2);
+}
+
+.status-low,
+.status-error {
+  color: var(--chip-red);
+  background: rgba(239, 68, 68, 0.16);
+}
+
+.status-paused {
+  color: var(--chip-yellow);
+  background: rgba(234, 179, 8, 0.16);
+}
+
+/* "Chưa có Offer" — nobody has bid, we have not either. Neutral, not a warning. */
+.status-none {
+  color: var(--chip-grey);
+  background: rgba(139, 147, 163, 0.18);
+}
+
+/* ---------------- cancel tab ---------------- */
+
+.cancel-progress {
+  margin-top: 8px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.cancel-result {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.cancel-result.ok {
+  color: var(--green);
+}
+
+.cancel-result.bad {
+  color: var(--red);
+}
+
+/* ---------------- logs ---------------- */
+
+.log-box {
+  height: calc(100vh - 190px);
+  overflow: auto;
+  padding: 10px 12px;
+  background: var(--surface-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #c3cad6;
+}
+
+.log-error {
+  color: #fca5a5;
+}
+.log-send {
+  color: #86efac;
+}
+.log-ontop {
+  color: #4ade80;
+}
+.log-outbid {
+  color: #fcd34d;
+}
+.log-low {
+  color: #f87171;
+}
+.log-stream {
+  color: #93c5fd;
+}
+.log-decision {
+  color: #c4b5fd;
+}
+
+.boot-error {
+  padding: 16px;
+  color: var(--red);
+  font-family: var(--mono);
+  white-space: pre-wrap;
+}
+
+/* ---------------- licence ---------------- */
+
+.license-line {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.license-ok {
+  border-color: #1e5f36;
+  color: var(--chip-green);
+}
+
+.license-bad {
+  border-color: #6b2020;
+  color: var(--chip-red);
+}
+
+/* ---------------- bulk offer ---------------- */
+
+.links-input-tall {
+  min-height: 130px;
+}
+
+/* A link the wallet has no offer on: shown so the row count always matches
+   the number of links pasted in. */
+.row-empty-link td {
+  color: var(--text-dim);
+  opacity: 0.75;
+}
+
+/* A deduplicated error that keeps repeating. */
+.log-repeat {
+  border-left: 2px solid var(--red);
+  padding-left: 6px;
+}
+
+/* ---------------- toasts ---------------- */
+
+.toast-host {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+  /* The stack must never block clicks on the table underneath. */
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  max-width: 420px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 8px;
+  background: var(--row-hover);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.4;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45);
+  cursor: pointer;
+  animation: toast-in 160ms ease-out;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.toast-out {
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 160ms ease-in, transform 160ms ease-in;
+}
+
+.toast-icon {
+  flex: 0 0 auto;
+  font-size: 13px;
+}
+
+.toast-text {
+  min-width: 0;
+  word-break: break-word;
+}
+
+.toast-success {
+  border-left-color: var(--green);
+}
+.toast-error {
+  border-left-color: var(--red);
+}
+.toast-warn {
+  border-left-color: var(--yellow);
+}
+.toast-info {
+  border-left-color: var(--blue);
+}
+
+/* ---------------- cancel: the destructive one-shot ---------------- */
+
+/* Pushes the wipe buttons hard against the right edge of the toolbar, well
+   clear of the everyday Scan / Cancel buttons. */
+.toolbar-right {
+  margin-left: auto;
+  display: flex;
+  gap: 10px;
+}
+
+.btn-nuke {
+  background: #5b1d5b;
+  border-color: #7b2a7b;
+  color: #fff;
+}
+
+.btn-nuke:hover:not(:disabled) {
+  border-color: #a13da1;
+}
+
+.cancel-counters {
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.cancel-counters .counter {
+  min-width: 132px;
+}
+
+/* ---------------- confirm modal ---------------- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.62);
+}
+
+.modal-card {
+  width: 100%;
+  max-width: 520px;
+  padding: 20px 22px;
+  border: 1px solid var(--border);
+  border-top: 3px solid var(--red);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+}
+
+.modal-title {
+  margin-bottom: 12px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--chip-red);
+}
+
+/* A confirmation that is not destructive says so in its colour: the red top
+   rule and the red heading belong to "this deletes things". */
+.modal-card.is-primary { border-top-color: var(--accent, #60a5fa); }
+.modal-title.is-primary { color: var(--text); }
+
+.modal-body {
+  max-height: 46vh;
+  overflow: auto;
+}
+
+.modal-line {
+  margin: 0 0 10px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+.modal-list {
+  margin: 0 0 12px;
+  padding-left: 20px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: #fca5a5;
+}
+
+.modal-ack {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 4px 0 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  font-size: 12.5px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.modal-ack input {
+  margin-top: 2px;
+  flex: 0 0 auto;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* ---------------- scrollbars ---------------- */
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2f3541;
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3c4453;
+}
+
+
+/* ------------------------------------------------------------------
+   SLL layout: Offer and Cancel wear the same shape, so the rules live
+   in one place and cannot drift apart between the two tabs.
+   ------------------------------------------------------------------ */
+
+.sll-panel {
+  margin-bottom: 14px;
+}
+
+.field-hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  opacity: 0.65;
+}
+
+.progress-track {
+  margin-top: 10px;
+  height: 10px;
+  width: 100%;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2f80ed, #56ccf2);
+  transition: width 240ms ease;
+}
+
+.result-card {
+  padding: 12px 14px;
+  border: 1px solid rgba(76, 175, 80, 0.45);
+  border-radius: 8px;
+  background: rgba(76, 175, 80, 0.08);
+}
+
+.result-title {
+  font-weight: 700;
+  margin-bottom: 10px;
+}
+
+.sll-footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+}
+
+
+/* ------------------------------------------------------------------
+   Light theme corrections.
+
+   Everything above draws from variables, so these are only the places
+   where a light ground needs something the palette alone cannot express.
+   ------------------------------------------------------------------ */
+
+/* Buttons keep white text on their solid fills, which stays correct on
+   light. The plain button, though, was borderless-dark: give it a real
+   surface so its label is not grey-on-grey. */
+:root[data-theme="light"] .btn {
+  background: var(--bg-panel);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+:root[data-theme="light"] .btn:hover:not(:disabled) {
+  background: var(--bg-elevated);
+}
+
+/* Disabled must still be READABLE, only clearly inactive. Fading a
+   control until its value cannot be read hides the price someone is
+   about to fire an offer at. */
+:root[data-theme="light"] .btn:disabled,
+:root[data-theme="light"] input:disabled,
+:root[data-theme="light"] select:disabled,
+:root[data-theme="light"] textarea:disabled {
+  opacity: 1;
+  color: var(--text);
+  background: var(--bg-elevated);
+  border-color: var(--border);
+}
+
+:root[data-theme="light"] .btn:disabled {
+  color: var(--text-dim);
+}
+
+/* Inputs: real text, and a placeholder that is visibly a placeholder
+   without disappearing. */
+:root[data-theme="light"] input,
+:root[data-theme="light"] textarea,
+:root[data-theme="light"] select {
+  background: var(--bg-panel);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+:root[data-theme="light"] input::placeholder,
+:root[data-theme="light"] textarea::placeholder {
+  color: var(--text-dim);
+  opacity: 1;
+}
+
+/* Counter labels and hints sit at --text-dim, which is dark enough on
+   light; the VALUES must be full strength so a number is never the
+   faintest thing on screen. */
+:root[data-theme="light"] .counter b,
+:root[data-theme="light"] .result-card b {
+  color: var(--text);
+}
+
+/* The result card's green wash is too weak to sit under dark text. */
+:root[data-theme="light"] .result-card {
+  background: rgba(21, 128, 61, 0.08);
+  border-color: rgba(21, 128, 61, 0.35);
+}
+
+/* Toasts and dialogs follow the panel surface rather than a dark literal. */
+:root[data-theme="light"] .toast,
+:root[data-theme="light"] .modal {
+  background: var(--bg-panel);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+/* Light: the values people read off the screen are the ones that must not be
+   the faintest thing on it. Headings and numbers go to full black; labels stay
+   dimmer so the hierarchy survives, but not so dim they stop being legible. */
+:root[data-theme="light"] .dash-title,
+:root[data-theme="light"] .panel-title,
+:root[data-theme="light"] .result-title,
+:root[data-theme="light"] .counter b,
+:root[data-theme="light"] .result-card b,
+:root[data-theme="light"] .num-input,
+:root[data-theme="light"] .links-input,
+:root[data-theme="light"] .text-input {
+  color: #000;
+}
+
+:root[data-theme="light"] input,
+:root[data-theme="light"] textarea,
+:root[data-theme="light"] select {
+  color: #000;
+}
+
+:root[data-theme="light"] .field-label,
+:root[data-theme="light"] .counter-label {
+  color: #2b323d;
+}
+
+/* A locked input still has to be readable: it is showing the price an offer is
+   about to be fired at. */
+:root[data-theme="light"] input:disabled,
+:root[data-theme="light"] select:disabled,
+:root[data-theme="light"] textarea:disabled {
+  color: #000;
+  -webkit-text-fill-color: #000;
+}
+
+/* ==================================================================
+   LICENSE LOCKED MODE
+
+   The app is unusable without a working licence, so it says so by being
+   unusable rather than by refusing each action one at a time. Settings is the
+   only reachable tab, and inside it only the License panel exists: an API key
+   box or a wallet field on a locked app is a field nobody should be filling
+   in, and one that was forgotten would be a way past the lock.
+   ================================================================== */
+
+body.license-locked .tab:disabled {
+  opacity: .38;
+  cursor: not-allowed;
+}
+
+/* Nothing below the fold to reach, so nothing invites a scroll for it. */
+body.license-locked .content {
+  overflow: hidden;
+}
+
+.settings-tab.is-locked {
+  overflow: hidden;
+  max-height: 100vh;
+}
+
+/* Every panel but the licence one leaves the layout entirely. */
+/* The update panel is the one exception in both locked modes: a user
+   locked out by an expired licence is often the one who needs the newer
+   build, and a button that is enabled but invisible is worse than no
+   button at all. */
+.settings-tab.is-locked .panel:not(.license-panel):not(.update-panel) {
+  display: none;
+}
+
+/* A grid whose every child is hidden still occupies its gap - except the
+   top row, which holds the licence screen and the update panel. */
+.settings-tab.is-locked > .settings-columns:not(.settings-columns-top) {
+  display: none;
+}
+
+/* Locked, the top row carries one panel: it gets the full width. */
+.settings-tab.is-locked > .settings-columns-top,
+.settings-tab.is-api-locked > .settings-columns-top {
+  grid-template-columns: 1fr;
+}
+
+/* The Save/Clear toolbar belongs to settings that are not reachable now. */
+.settings-tab.is-locked > .toolbar-row,
+.settings-tab.is-locked > .settings-actions {
+  display: none;
+}
+
+.lock-notice {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--danger, #c0392b);
+  background: color-mix(in srgb, var(--danger, #c0392b) 12%, transparent);
+  color: var(--danger, #c0392b);
+  font-weight: 600;
+}
+
+
+/* ==================================================================
+   REDESIGN LAYER
+
+   Appended rather than merged into the rules above, so the earlier
+   file stays readable as the structural stylesheet and this stays
+   readable as the presentation pass over it. Everything here reads the
+   same tokens, so both themes follow without a second set of rules.
+
+   The brief: a user glancing at any tab should be able to answer four
+   questions without reading a sentence twice - what is it doing, how
+   far has it got, how much is left, and did anything break. That is
+   what the spacing, the single accent and the one badge per panel are
+   for. Density is the enemy of a scannable screen, and so is colour
+   used for decoration.
+   ================================================================== */
+
+:root {
+  --gap: 14px;
+  --gap-lg: 20px;
+  --radius-lg: 12px;
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, .28);
+}
+:root[data-theme="light"] {
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .07);
+}
+
+body { font-family: var(--font); }
+
+/* ---- shell ------------------------------------------------------- */
+
+.topbar {
+  gap: var(--gap-lg);
+  padding: 10px var(--gap-lg);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  font-weight: 650;
+  letter-spacing: -.01em;
+}
+
+/* The tab strip carries the app's only persistent navigation, so it is
+   quiet until something is selected. */
+.tabbar { gap: 2px; }
+
+.tab {
+  padding: 7px 14px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  font-weight: 500;
+  transition: background .12s ease, color .12s ease;
+}
+.tab:hover:not(:disabled) { background: var(--bg-elevated); color: var(--text); }
+.tab-active,
+.tab-active:hover:not(:disabled) {
+  background: var(--bg-elevated);
+  border-color: var(--border);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.statusbar {
+  color: var(--text-dim);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.content { padding: var(--gap-lg); }
+
+/* ---- cards ------------------------------------------------------- */
+
+.panel {
+  padding: var(--gap-lg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+  box-shadow: var(--shadow-card);
+  margin-bottom: var(--gap);
+}
+
+.panel-title {
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: -.01em;
+  color: var(--text);
+  margin-bottom: 12px;
+}
+
+/* A title on the left, the one badge that describes the card on the right. */
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap);
+  margin-bottom: 12px;
+}
+.panel-head .panel-title { margin-bottom: 0; }
+
+.dash-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--gap);
+  margin-bottom: var(--gap);
+}
+
+.dash-title {
+  font-size: 18px;
+  font-weight: 650;
+  letter-spacing: -.02em;
+  margin: 0;
+}
+
+/* ---- counters ---------------------------------------------------- */
+
+.counters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px var(--gap-lg);
+  align-items: baseline;
+}
+
+.counter {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 84px;
+}
+
+.counter-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.counter b {
+  font-size: 17px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.01em;
+}
+
+/* ---- state badges ------------------------------------------------ */
+
+/* One badge per panel, one meaning per colour. Anything that is merely
+   in progress is neutral: reserving colour for outcomes is what lets a
+   red badge actually mean something. */
+.state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 550;
+  white-space: nowrap;
+}
+.state::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.state-idle  { color: var(--grey); }
+.state-ready { color: var(--blue); }
+.state-run   { color: var(--blue); }
+.state-done  { color: var(--green); }
+.state-warn  { color: var(--yellow); }
+.state-fail  { color: var(--red); }
+
+/* ---- progress ---------------------------------------------------- */
+
+.progress-panel .progress-track { margin-top: 4px; }
+
+.progress-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.progress-headline {
+  font-size: 13px;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+/* The number is the point of the panel, so it is the largest thing on it. */
+.progress-count {
+  font-size: 22px;
+  font-weight: 680;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.02em;
+  color: var(--text);
+}
+
+.progress-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  overflow: hidden;
+  margin: 10px 0 var(--gap);
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width .2s ease;
+}
+
+/* ---- per-item list ----------------------------------------------- */
+
+/* The only scrolling region on a tab. Everything above it - the counts,
+   the bar, the buttons - stays put while this is what moves. */
+.item-list {
+  max-height: 240px;
+  overflow-y: auto;
+  margin-top: var(--gap);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-sunken);
+}
+.item-list:empty { display: none; }
+
+.item-row {
+  display: grid;
+  grid-template-columns: 20px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+.item-row:last-child { border-bottom: none; }
+
+.item-mark { text-align: center; color: var(--text-dim); }
+.item-name { font-family: var(--mono); color: var(--text); }
+.item-state { color: var(--text-dim); font-size: 12px; }
+
+.item-working .item-mark { color: var(--blue); }
+.item-done .item-mark    { color: var(--green); }
+.item-skip .item-mark    { color: var(--grey); }
+.item-fail .item-mark    { color: var(--red); }
+.item-fail .item-state   { color: var(--red); }
+
+/* ---- licence ----------------------------------------------------- */
+
+.license-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.license-expiry {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+/* ---- logs -------------------------------------------------------- */
+
+.log-line {
+  padding: 3px 10px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  border-left: 2px solid transparent;
+}
+.log-info  { color: var(--text); }
+.log-warn  { color: var(--yellow); border-left-color: var(--yellow); }
+.log-error { color: var(--red); border-left-color: var(--red); }
+
+/* The technical view keeps the monospace the raw record needs. */
+.log-debug {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+/* ---- buttons ----------------------------------------------------- */
+
+.btn {
+  padding: 7px 14px;
+  border-radius: var(--radius);
+  font-size: 13px;
+  font-weight: 550;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.btn-ghost.is-on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ---- table ------------------------------------------------------- */
+
+.nft-table th {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  text-transform: none;
+  color: var(--text-dim);
+}
+
+.nft-table td { font-size: 13px; }
+
+.cell-price { font-variant-numeric: tabular-nums; }
+
+/* ---- status chips in the table ----------------------------------- */
+
+.status, .scan {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 550;
+  white-space: nowrap;
+}
+
+/* ---- the window ---------------------------------------------------
+   Nothing but a list may scroll. A toolbar that scrolls away takes the
+   button the user is reaching for with it. */
+
+.sll-footer,
+.toolbar-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.hint {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin: 8px 0 0;
+}
+
+
+/* ---- one more pass, from looking at the screens -------------------
+
+   Every label was being upper-cased by the original stylesheet. On a
+   dense screen that reads as a row of alarms and flattens the very
+   hierarchy the type sizes are there to create - and Vietnamese
+   diacritics survive capitalisation badly. Sentence case throughout,
+   with weight and colour doing the ranking instead. */
+
+.panel-title,
+.counter-label,
+.field-label,
+.dash-title,
+.nft-table th,
+.result-title {
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.field-label {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+
+/* The counters read as figures, not as boxed cards. */
+.dash-head .counters .counter {
+  border: none;
+  background: transparent;
+  padding: 0;
+}
+
+/* The friendly log is prose and reads as prose. Only the technical view
+   keeps the monospace the raw record needs. */
+.log-line { font-family: var(--font); }
+.log-line.log-debug { font-family: var(--mono); }
+
+/* An empty status line must not leave a coloured box behind. */
+.license-line:empty { display: none; }
+
+/* ---- API LOCKED MODE ----------------------------------------------
+
+   The same shape as the licence lock and deliberately not the same
+   rule: the two never apply at once, and sharing one selector would
+   make that impossible to see. Here the OpenSea API panel is the only
+   thing left on the tab. */
+
+body.api-locked .tab:disabled {
+  opacity: .4;
+  cursor: not-allowed;
+}
+
+body.api-locked .content {
+  overflow: hidden;
+}
+
+.settings-tab.is-api-locked {
+  overflow: hidden;
+  max-height: 100vh;
+}
+
+.settings-tab.is-api-locked .panel:not(.api-panel):not(.update-panel) {
+  display: none;
+}
+
+/* One column while locked: the wrapper still holds the API panel. */
+.settings-tab.is-api-locked > .settings-columns {
+  grid-template-columns: 1fr;
+}
+
+.settings-tab.is-api-locked > .dash-head {
+  margin-bottom: var(--gap);
+}
+
+/* ---- Offer SLL / Cancel: one screen -------------------------------
+
+   Setup across the top, progress underneath, the item list taking the
+   rest. The tab itself does not scroll: a toolbar that scrolls away
+   takes the button the user is reaching for with it, and a progress
+   figure below the fold is a progress figure nobody sees. */
+
+.sll-tab {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  /* Height comes from the shell, not from a guessed constant - see the
+     one-screen rules further down. */
+  overflow: hidden;
+}
+
+.sll-tab > .dash-head { margin-bottom: 0; flex: 0 0 auto; }
+
+/* The two setup cards share the width instead of stacking. */
+.sll-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--gap);
+  flex: 0 0 auto;
+}
+
+.sll-row > .panel { margin-bottom: 0; }
+
+.sll-tab .panel { padding: 14px 16px; }
+
+/* Compact enough that a list of links does not push progress off screen,
+   tall enough to check what was pasted. */
+.sll-tab .links-input,
+.sll-tab .links-input-tall {
+  min-height: 84px;
+  max-height: 120px;
+}
+
+.sll-tab .counters { gap: 4px 16px; }
+.sll-tab .counter b { font-size: 15px; }
+
+/* The progress card takes the remaining height and hands it to the list,
+   which is the only thing on the tab allowed to scroll. */
+.sll-tab > .progress-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0;
+}
+
+.sll-tab > .progress-panel .item-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
+.sll-tab .progress-track { margin: 8px 0 10px; }
+
+/* Irreversible actions, kept apart from everything routine. */
+.danger-panel { flex: 0 0 auto; margin-bottom: 0; }
+
+@media (max-width: 1100px) {
+  .sll-row { grid-template-columns: 1fr; }
+}
+
+/* A disabled control must look unavailable, not merely be unavailable. */
+.btn:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+/* ---- a chain stopped by a clean cancel ----------------------------
+   Loud enough not to be missed, and it names the one action that
+   undoes it. */
+.halt-notice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  margin-bottom: var(--gap);
+  border: 1px solid var(--red);
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+}
+.halt-text { font-size: 13px; color: var(--text); }
+
+
+/* ---- hidden must win ----------------------------------------------
+
+   The user-agent's [hidden] { display: none } is the weakest rule in
+   the cascade, so ANY author rule that sets display beats it - and an
+   element the code has marked hidden gets painted anyway. That is
+   exactly how the clean-cancel banner appeared on a freshly started
+   app with nothing cancelled.
+
+   Declared once, last, and !important, so setting .hidden in code
+   cannot be silently overruled by a layout rule written later. */
+
+[hidden] {
+  display: none !important;
+}
+
+/* ---- the one-screen tabs, measured rather than guessed ------------
+
+   `.sll-tab` used to be `calc(100vh - 92px)`, where 92 was my estimate
+   of the top bar plus the content padding. An estimate is wrong on any
+   window the estimate was not made on, and it was already two pixels
+   out on this one - enough for the page itself to scroll.
+
+   The shell is already a full-height flex column, so the height is
+   available for free: let the content area be the flex child that
+   fills, and let the tab be exactly its parent. No constant to drift. */
+
+.content { min-height: 0; }
+
+.panel-page { height: 100%; }
+
+.sll-tab {
+  height: 100%;
+  /* Belt and braces: a flex child will not shrink below its content
+     without this, which is how a long list pushes a toolbar off screen. */
+  min-height: 0;
+}
+
+/* ---- the update panel ---------------------------------------------
+   First on the tab, reachable in both locked modes, and SHORT: it sits
+   above Save, and Save must stay in the first screenful. */
+.update-panel { padding: 12px 16px; }
+.update-panel .panel-head { margin-bottom: 8px; }
+
+/* Message and buttons share one line; the message takes what is left. */
+.update-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap);
+  flex-wrap: wrap;
+}
+.update-row .update-message { flex: 1 1 auto; min-width: 0; }
+.update-row .toolbar-row { flex: 0 0 auto; }
+
+/* Costs no height until a download is actually running. */
+.update-panel .progress-track { margin: 10px 0 0; }
+
+/* ---- Settings density ---------------------------------------------
+
+   Save must be reachable without scrolling. Every panel added above it
+   spends part of that budget, so the tab as a whole is tighter than
+   the default card spacing - the fields are one line each and do not
+   need twenty pixels of air around them. */
+
+.settings-tab .panel {
+  padding: 14px 16px;
+  margin-bottom: 10px;
+}
+
+.settings-tab .panel-title { margin-bottom: 8px; }
+.settings-tab .panel-head { margin-bottom: 8px; }
+.settings-tab .dash-head { margin-bottom: 10px; }
+
+/* ------------------------------------------------------------------
+   Settings: two columns, one screen
+
+   The page is a form the user visits to paste two credentials and leave.
+   Everything on it now saves itself, so there is no Save button to keep
+   above the fold - but the whole page still has to fit, because a setting
+   below the fold is a setting nobody knows exists.
+   ------------------------------------------------------------------ */
+
+.settings-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  align-items: start;
+}
+
+.settings-columns > .panel {
+  margin: 0;
+  min-width: 0;
+}
+
+/* Narrow windows stop pretending to have two columns. */
+@media (max-width: 900px) {
+  .settings-columns { grid-template-columns: 1fr; }
+}
+
+/* ------------------------------------------------------------------
+   Settings: a form, not a page of cards
+
+   The tab holds four inputs and five buttons. Given a titled panel each,
+   the chrome was taller than the content and pushed real controls off
+   the screen. Everything below exists to take height out.
+   ------------------------------------------------------------------ */
+
+.settings-tab {
+  gap: 8px;
+}
+
+.settings-tab > .panel,
+.settings-columns > .panel {
+  padding: 8px 10px;
+  margin: 0;
+}
+
+.settings-tab .panel-title {
+  font-size: 12px;
+  margin: 0;
+  white-space: nowrap;
+}
+
+/* A row that holds a label+input and its button on one line. */
+.srow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.srow + .srow { margin-top: 6px; }
+
+.srow > .field {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+}
+
+/* Label beside the input rather than above it: stacking cost a line of
+   height per field, and there are four of them. */
+.srow > .field,
+.field-inline {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.srow > .field > .field-label,
+.field-inline > .field-label {
+  flex: 0 0 auto;
+  margin: 0;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.srow > .field > input,
+.srow > .field > select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.srow-actions {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.settings-tab .update-panel .srow > .info-line {
+  flex: 0 1 auto;
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Theme, the two scan settings and the session state on one strip. */
+.settings-strip {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.settings-strip > .field {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+.settings-strip .num-input { width: 72px; }
+.settings-strip .select-input { width: 90px; }
+
+.settings-strip > .info-line {
+  margin: 0 0 0 auto;
+  white-space: nowrap;
+}
+
+.session-wallet-panel .remote-title {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.session-wallet-panel > .info-line {
+  margin-top: 6px;
+  /* A long status/Remote URL must not grow this panel — that pushes every
+     panel below it down the page (section E: "Remote URL dài làm panel đổi
+     kích thước", "429/cooldown/Active làm layout co giãn"). Truncate with an
+     ellipsis instead; the full text is still in the element's title. */
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 2px 0;
+}
+
+.settings-footer > .form-error {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+}
+
+/* The licence expiry sits beside its badge, not on a line of its own. */
+.settings-tab .license-expiry {
+  font-size: 12px;
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+.settings-tab .lock-notice { margin: 6px 0; }
+
+/* The licence holder's name shares the card's title row. */
+.settings-tab .license-name {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40%;
+}
+
+/* ------------------------------------------------------------------
+   Offer Item dashboard: one screen, and only the list moves
+
+   The page scrolled as a whole, so a wheel gesture over the NFT table
+   carried the header, the Add-NFT panel and the toolbar up with it - the
+   controls the user was reaching for left the screen because they were
+   reading the row they wanted to act on.
+
+   Same shape as the SLL and Cancel tabs: the tab fills the viewport, the
+   fixed furniture keeps its height, and the table is the only thing with
+   anything to scroll.
+   ------------------------------------------------------------------ */
+
+.dashboard {
+  display: flex;
+  flex-direction: column;
+  /* The content area's own padding is already accounted for by its box, so
+     100% of it is exactly the room this tab has. */
+  height: 100%;
+  min-height: 0;
+  gap: 10px;
+}
+
+/* Everything above the list keeps its natural height and stays put. */
+.dashboard > .dash-head,
+.dashboard > .halt-notice,
+.dashboard > .panel,
+.dashboard > .toolbar-row {
+  flex: 0 0 auto;
+}
+
+/* The list, and nothing else, scrolls. */
+.dashboard > .table-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: auto;
+}
+
+/* The header row of the table stays visible while the rows move under it. */
+.dashboard > .table-wrap .nft-table th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+/* With a dashboard open the page itself has nothing to scroll: the tab is
+   exactly as tall as the area it sits in. A page that still scrolls invites
+   the user to look for something below the fold that is not there.
+
+   CHUỖI CHIỀU CAO PHẢI LIỀN MẠCH
+   .app (100vh, flex cột) → .content (flex 1, min-height 0) → .panel-page
+   (100%, flex cột) → .dashboard (flex 1, min-height 0) → .table-wrap (flex 1,
+   min-height 0, cuộn). Đứt một mắt xích là bảng cao theo nội dung và trang
+   cuộn — hoặc bảng bị ép thành vài hàng trong khi bên dưới trống. Bản trước
+   nhắm `.content > .dashboard` nhưng dashboard nằm TRONG .panel-page, nên
+   luật đó chưa bao giờ khớp. */
+body.tab-dashboard .content {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+body.tab-dashboard .panel-page.is-active {
+  display: flex !important;   /* thắng inline display:block của showTab */
+  flex-direction: column;
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
+}
+body.tab-dashboard .panel-page.is-active > .dashboard {
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
+}
+
+/* Bulk progress, shared by the offer and the cancel run. */
+.bulk-progress {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--panel-2, #1b1f27);
+  margin-bottom: 10px;
+}
+.bulk-progress .count { font-variant-numeric: tabular-nums; }
+.bulk-progress .count b { font-size: 15px; }
+.bulk-progress .ok b { color: var(--good, #4ade80); }
+.bulk-progress .bad b { color: var(--bad, #f87171); }
+.bulk-progress .run b { color: var(--accent, #60a5fa); }
+
+.bulk-bar {
+  flex: 1 1 160px;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.10);
+  overflow: hidden;
+}
+.bulk-bar > span {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--accent, #60a5fa);
+  transition: width 180ms linear;
+}
+
+/* ---- Offer Item: the link box shows FIVE rows, whatever is in it ----
+ *
+ * THE GUTTER WAS DRIVING THE HEIGHT, NOT THE TEXTAREA
+ *
+ *   A textarea does not grow with its content, so the box itself was never
+ *   the problem. `.lines-wrap` is a flex row with `align-items: stretch`, and
+ *   `.lines-gutter` renders one line per NFT as `white-space: pre` with no
+ *   height limit. 120 links made the GUTTER 120 lines tall, the row stretched
+ *   to match, and the textarea was stretched with it - so the card grew with
+ *   the list and pushed Min/Max/Step/Duration and the whole Điều khiển card
+ *   off the screen. `overflow: hidden` on the gutter clipped the paint and did
+ *   nothing about the layout, which is why it looked like it should already
+ *   have worked.
+ *
+ *   Fixing it on the textarea alone would not have worked either: the gutter
+ *   would still have set the row's height. The height belongs on the ROW, and
+ *   both children are then told to scroll inside it rather than define it.
+ *
+ * This is a DISPLAY limit only. Every link stays in the textarea's value, in
+ * the tab's state and in what the engine is given - see offer-item-ui-test.
+ */
+.add-panel .lines-wrap {
+  /* 5 dòng x line-height, + 8px padding trên và dưới, + 2px viền của
+     chính .lines-wrap.
+
+     Viền phải được cộng vào vì hộp này là border-box: bỏ quên nó thì vùng
+     nội dung chỉ còn 87px trong khi 5 dòng cần 89.125px, và đúng trường hợp
+     "5 link" — cái phải vừa khít — lại sinh ra thanh cuộn. */
+  height: calc(5 * 1.55 * 11.5px + 18px);
+  min-height: calc(5 * 1.55 * 11.5px + 18px);
+  max-height: calc(5 * 1.55 * 11.5px + 18px);
+  align-items: stretch;
+}
+.add-panel .lines-wrap .lines-gutter {
+  /* Scrolled in step with the textarea by withLineNumbers(); never a
+     scrollbar of its own, or there would be two. */
+  overflow: hidden;
+  height: 100%;
+}
+.add-panel .lines-wrap .links-input {
+  height: 100%;
+  min-height: 0;
+
+  /* 8px trên dưới, KHỚP với .lines-gutter.
+   *
+   * Quy tắc gốc `.links-input` dùng 9px, còn chiều cao của hàng lại tính theo
+   * 16px của gutter. Lệch 2px đó đủ để 5 dòng cao 89.125px không vừa vùng nội
+   * dung 87px, nên đúng cái trường hợp "5 link" — cái phải vừa khít — lại sinh
+   * ra thanh cuộn. Hai con số này phải là một, nếu không chiều cao hàng đang
+   * mô tả một hộp khác với hộp thật sự chứa chữ. */
+  padding-top: 8px;
+  padding-bottom: 8px;
+  /* The one scroller. `resize` is off because dragging the textarea taller
+     inside a fixed-height row only desynchronises it from the gutter. */
+  resize: none;
+  overflow-y: auto;
+
+  /* A very long URL scrolls INSIDE the box.
+   *
+   * Wrapping it instead (`overflow-wrap: anywhere`) would remove the sideways
+   * scroll, and would also break the line numbers: the gutter prints one
+   * number per NEWLINE, so a URL wrapped across two visual lines puts every
+   * number below it against the wrong link. The numbers exist to say which
+   * pasted link is the bad one, so they win. The scroll is contained here and
+   * never widens the card, which is what the layout had to guarantee.
+   */
+  overflow-x: auto;
+}
+
+/* Offer Custom: Lọc NFT and Reset stay put.
+   The NFT list is the only thing that scrolls - a Reset button that scrolls
+   away with an 8,000-row match is a Reset button you cannot reach when you
+   most want it. */
+.custom-filters {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.custom-filters .filter-block:not(.filter-actions) {
+  overflow-y: auto;
+  min-height: 0;
+}
+.filter-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 3;
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+.filter-actions .btn { flex: 1 1 0; }
+
+
+/* ==================================================================
+   Offer Item — khu thêm/danh sách NFT cao đúng 5 hàng
+   ==================================================================
+
+   Danh sách NFT từng cao bằng số hàng nó có, nên thêm NFT là cả trang
+   phình ra và thanh công cụ bị đẩy khỏi màn hình. Giới hạn ở 5 hàng cộng
+   hàng tiêu đề: hàng thứ 6 trở đi cuộn BÊN TRONG khung, và khung thì đứng
+   yên dù danh sách có 5 hay 5.000 NFT.
+
+   Con số dùng ch (chiều cao hàng) chứ không phải px cố định, nên nó vẫn
+   đúng khi người dùng đổi cỡ chữ hệ thống. --osb-row-h là chiều cao thật
+   của một hàng .nft-table đo từ padding + line-height hiện có.            */
+
+:root {
+  --osb-row-h: 38px;
+  --osb-head-h: 34px;
+}
+
+/* Bảng NFT: chiếm phần còn lại của tab (flex ở trên) và cuộn BÊN TRONG.
+   Giới hạn 5 hàng từng đặt ở đây là nhầm chỗ — giới hạn 5 dòng là của ô dán
+   link (.add-panel .links-input), không phải của danh sách NFT. Với 100 NFT
+   một khung 5 hàng là 20 lần cuộn để đọc hết bảng. Không đặt min-height:
+   tab phải vừa màn hình ở mọi cỡ cửa sổ (ui-persistence-test ghim "TRANG
+   không cuộn"), nên bảng nhận đúng phần còn lại — ở 720px cao vẫn ~5 hàng. */
+.dashboard > .table-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+  overflow-y: auto;
+  overflow-x: auto;
+  /* Chỗ cho thanh cuộn được giữ sẵn: thanh cuộn hiện ra không đè lên cột
+     Delete ở mép phải. */
+  scrollbar-gutter: stable;
+}
+
+/* Hàng cuối không bị cắt: đệm đáy trong khung cuộn để ô cuối, kể cả viền
+   dưới và nút Delete, luôn lọt trọn khi cuộn tới cùng. */
+.dashboard > .table-wrap { padding-bottom: 6px; }
+
+/* Tiêu đề bảng: một hàng riêng, nền đặc, nằm trên mọi hàng khi cuộn. Nền của
+   <thead> chứ không chỉ <th>: khoảng hở giữa các ô cũng phải đặc, nếu không
+   chữ của hàng đầu lộ qua kẽ tiêu đề. */
+.dashboard > .table-wrap .nft-table thead {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--bg-elevated);
+}
+.dashboard > .table-wrap .nft-table thead th {
+  background: var(--bg-elevated);
+  box-shadow: inset 0 -1px 0 var(--border);
+}
+
+/* Step tự động theo Best: tô nhẹ để biết con số này do engine chọn. */
+.nft-table .row-input.is-auto { color: var(--chip-blue); }
+
+.nft-table td .scan,
+.nft-table td .status { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+
+/* ==================================================================
+   Offer Custom — không có thanh cuộn ngang, chỉ danh sách cuộn
+   ================================================================== */
+
+/* Trang không bao giờ tự cuộn ngang. Bảng rộng thì cuộn TRONG khung của
+   nó — một thanh cuộn ngang ở mép cửa sổ làm lệch cả bố cục, kể cả những
+   phần vốn vừa khít. */
+.custom-page { overflow-x: hidden; }
+.custom-split { overflow-x: hidden; }
+.custom-results { overflow-x: hidden; }
+.result-scroll { overflow-x: auto; }
+
+/* Hai nút dưới bảng lọc phải vừa đúng 236px, kể cả với nhãn dài như
+   "Làm mới". flex: 1 1 0 chia đều, min-width: 0 cho phép chúng co lại
+   thay vì đẩy nhau ra ngoài khung. */
+.filter-actions .btn {
+  flex: 1 1 0;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+
+
+/* Ô credential đã lưu nhưng giải mã không ra — xem renderSecrets().
+   Viền đỏ để mắt tìm đúng ô cần nhập lại, thay vì đọc một câu dài rồi
+   phải tự dò xem nó nói về ô nào. */
+.text-input.needs-reentry {
+  border-color: var(--bad);
+  box-shadow: 0 0 0 1px var(--bad) inset;
+}
+
+/* ---- Dùng chung (utils.js): hộp nhập nhiều dòng có số dòng, nhấn mạnh trong modal ---- */
+.modal-strong {
+  margin-bottom: 10px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+}
+.lines-wrap {
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-sunken);
+  overflow: hidden;
+}
+.lines-gutter {
+  flex: 0 0 auto;
+  min-width: 34px;
+  padding: 8px 6px 8px 8px;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  text-align: right;
+  white-space: pre;
+  user-select: none;
+}
+.lines-wrap .links-input {
+  flex: 1 1 auto;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+/* ==================================================================
+   v1.19.23 — mockup-accurate Offer Item workspace
+   ================================================================== */
+:root[data-theme="dark"] {
+  --bg: #07111f;
+  --bg-panel: rgba(12, 25, 42, .82);
+  --bg-elevated: #12243a;
+  --border: #20364f;
+  --text: #eef6ff;
+  --text-dim: #9eb4ce;
+  --accent: #2388ff;
+  --surface-sunken: #081522;
+  --row-hover: #102238;
+  /* Dark is the default theme (db.js DEFAULT_SETTINGS.theme). Same value as
+     the base :root — see the comment there for why 44px was too tight. */
+  --row-h: 56px;
+}
+
+body {
+  background:
+    radial-gradient(circle at 70% -20%, rgba(38, 108, 181, .18), transparent 38%),
+    linear-gradient(180deg, #091523 0%, #07111d 100%);
+}
+
+.topbar {
+  min-height: 56px;
+  padding: 5px 18px;
+  background: rgba(7, 17, 31, .88);
+  border-bottom-color: #1b3047;
+  backdrop-filter: blur(16px);
+}
+.tabbar { gap: 0; height: 100%; }
+.tab {
+  min-width: 138px;
+  height: 46px;
+  padding: 0 18px;
+  border: 0;
+  border-right: 1px solid rgba(104, 137, 172, .16);
+  border-radius: 0;
+  background: transparent;
+  color: #b8cdeb;
+  font-size: 14px;
+}
+.tab { display:flex; align-items:center; justify-content:center; gap:12px; }
+.tab::before { content:""; width:20px; color:#87baff; font-size:20px; line-height:1; text-align:center; }
+.tab[data-tab="ethereum"]::before { content:"♦"; color:#3792ff; transform:scaleX(.72); }
+.tab[data-tab="robinhood"]::before { content:"➤"; color:#20e479; transform:rotate(-35deg); }
+.tab[data-tab="bulk"]::before { content:"◆"; color:#9fc7ff; transform:scaleX(1.18) rotate(8deg); }
+.tab[data-tab="cancel"]::before { content:"✕"; color:#9fc7ff; font-size:23px; font-weight:300; }
+.tab[data-tab="settings"]::before { content:"⚙"; color:#9fc7ff; }
+.tab[data-tab="logs"]::before { content:"▤"; color:#a9ceff; }
+.tab-active,
+.tab-active:hover:not(:disabled) {
+  color: #fff;
+  background: linear-gradient(180deg, rgba(27, 75, 128, .72), rgba(13, 42, 76, .84));
+  border: 1px solid #1682ff;
+  border-bottom: 3px solid #2a95ff;
+  border-radius: 7px;
+  box-shadow: inset 0 0 18px rgba(37, 132, 255, .12);
+}
+.statusbar {
+  margin-left: auto;
+  color: #b6cce8;
+  font-family: var(--font);
+  font-size: 13px;
+}
+
+.content { padding: 14px 18px 12px; }
+.panel-page.is-active,
+.panel-page.is-active > .dashboard { height: 100%; min-height: 0; }
+.dashboard { display:flex; flex-direction:column; gap:12px; }
+.dashboard-top {
+  display:grid;
+  grid-template-columns: minmax(560px, 3fr) minmax(470px, 2fr);
+  gap:12px;
+  flex:0 0 auto;
+}
+.panel {
+  margin:0;
+  padding:13px 15px;
+  border:1px solid var(--border);
+  border-radius:10px;
+  background:linear-gradient(145deg, rgba(15,31,50,.88), rgba(9,22,37,.82));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.025), 0 8px 24px rgba(0,0,0,.12);
+}
+.panel-title {
+  margin:0 0 8px;
+  color:#f2f7ff;
+  font-size:14px;
+  font-weight:700;
+  letter-spacing:0;
+  text-transform:none;
+}
+.add-panel .lines-wrap {
+  height:64px;
+  min-height:64px;
+  max-height:64px;
+  border-color:#29435f;
+  background:#091827;
+}
+.add-panel .lines-gutter { display:none; }
+.add-panel .links-input { padding:7px 10px; color:#b8cae2; }
+.config-grid { display:grid; grid-template-columns:repeat(4,minmax(92px,1fr)) minmax(136px,1.1fr); gap:12px; margin-top:8px; }
+.config-grid .field { min-width:0; }
+.config-grid .num-input { width:100%; height:32px; }
+.field-label { color:#9fb5d0; text-transform:none; letter-spacing:0; }
+.field-action .btn { width:100%; }
+.btn { height:40px; border-radius:7px; font-size:13px; }
+.btn-primary { background:linear-gradient(180deg,#2b91ff,#126be8); border-color:#2688fa; box-shadow:0 4px 14px rgba(28,121,241,.24); }
+
+.toolbar { display:flex; flex-direction:column; }
+.toolbar-row { display:grid; grid-template-columns:repeat(4,minmax(105px,1fr)); gap:10px; }
+.toolbar-row .btn { min-width:0; width:100%; }
+.toolbar-row .selection-label,
+.toolbar-row .toolbar-hint { display:none; }
+.btn-start { background:linear-gradient(180deg,#0caf68,#07844d); border-color:#0aad66; }
+.btn-pause { background:linear-gradient(180deg,#c68a08,#9b6700); border-color:#bd8207; }
+.btn-danger { background:linear-gradient(180deg,#df3038,#b91e27); border-color:#d92c34; }
+.save-toggle { background:#14263d; border-color:#2d4664; }
+.save-toggle.is-on { background:linear-gradient(180deg,#1c3d61,#142c48); box-shadow:inset 0 0 14px rgba(76,145,255,.12); }
+.counters {
+  display:grid;
+  grid-template-columns:repeat(5,1fr);
+  gap:0;
+  margin-top:16px;
+  border-top:1px solid rgba(84,119,153,.22);
+}
+.counter {
+  display:flex;
+  flex-direction:column;
+  gap:3px;
+  min-width:0;
+  padding:10px 8px 0;
+  border:0;
+  border-right:1px solid rgba(84,119,153,.22);
+  border-radius:0;
+  background:transparent;
+}
+.counter:last-child { border-right:0; }
+.counter-label { color:#9db2cb; font-size:11px; text-transform:none; letter-spacing:0; }
+.counter b { margin:0; color:#f3f8ff; font-size:20px; }
+
+.table-shell {
+  position:relative;
+  display:flex;
+  flex:1 1 auto;
+  min-height:0;
+  flex-direction:column;
+  padding-right:42px;
+  overflow:hidden;
+  border:1px solid var(--border);
+  border-radius:10px;
+  background:rgba(7,18,31,.76);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.025);
+}
+.table-head {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  flex:0 0 45px;
+  gap:12px;
+  padding:6px 8px 6px 14px;
+  border-bottom:1px solid var(--border);
+  background:rgba(12,27,45,.82);
+}
+.table-title { color:#f0f6ff; font-size:15px; font-weight:700; }
+.table-title::after { content:"  ↻"; color:#9fc3ef; font-weight:400; }
+.table-head .nft-search {
+  width:min(360px,38vw);
+  height:34px;
+  margin:0;
+  padding:0 34px 0 36px;
+  border:1px solid #29445f;
+  border-radius:7px;
+  background:#102137;
+  color:#dceaff;
+}
+.table-head::after { content:"⌕"; position:absolute; right:370px; color:#9dc2ed; font-size:20px; pointer-events:none; }
+.table-wrap {
+  flex:1 1 auto;
+  min-height:0;
+  overflow:auto;
+  border:0;
+  border-radius:0;
+  background:transparent;
+  scrollbar-gutter:stable;
+}
+.one-row-scroll {
+  position:absolute;
+  z-index:8;
+  top:7px;
+  right:5px;
+  bottom:auto;
+  float:none;
+  display:grid;
+  gap:8px;
+}
+.one-row-scroll button {
+  width:32px;
+  height:38px;
+  border-color:#29435f;
+  border-radius:7px;
+  background:#102239;
+  color:#a9c4e6;
+}
+.one-row-scroll button:last-child { margin-top:2px; }
+.nft-table th {
+  top:0;
+  height:40px;
+  padding:0 8px;
+  background:#152940;
+  color:#abc0d9;
+  font-size:11px;
+  text-transform:none;
+  letter-spacing:0;
+}
+.nft-table td { border-bottom-color:#1c3148; }
+.nft-table tbody tr:nth-child(even) { background:rgba(17,37,60,.22); }
+.nft-table tbody tr:hover { background:#132a45; }
+.nft-name { color:#edf5ff; }
+.nft-sub { color:#91a9c4; }
+.row-index { color:#c5d5e8; font-variant-numeric:tabular-nums; }
+.row-input { background:#102238; border-color:#263e59; }
+.icon-btn { width:30px; height:30px; background:#11263e; border-color:#29435f; }
+.status {
+  padding:5px 11px;
+  border-radius:999px;
+}
+.status::before { content:"●"; margin-right:6px; font-size:10px; }
+.scan {
+  width:116px;
+  height:8px;
+  padding:0;
+  overflow:hidden;
+  border-radius:999px;
+  color:transparent;
+  background:repeating-linear-gradient(90deg,#27405b 0 18px,transparent 18px 21px);
+}
+.scan-scanning,.scan-next { background:repeating-linear-gradient(90deg,#2c91ff 0 18px,#1a3a5f 18px 21px); }
+.scan-send { background:repeating-linear-gradient(90deg,#28da83 0 18px,#1a3a5f 18px 21px); }
+.scan-stopped,.scan-error { background:repeating-linear-gradient(90deg,#284059 0 18px,transparent 18px 21px); }
+
+.app-footer {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  flex:0 0 28px;
+  padding:0 18px;
+  border-top:1px solid #1c3047;
+  background:rgba(7,17,30,.9);
+  color:#8197b0;
+  font-size:11px;
+}
+.footer-ready { color:#8fa6bf; }
+.footer-ready::first-letter { color:#28dc85; }
+
+@media (max-width: 1180px) {
+  .dashboard-top { grid-template-columns:1fr; }
+  .tab { min-width:auto; padding:0 12px; }
+  .dashboard-top .panel { padding:10px 12px; }
+  .add-panel .lines-wrap { height:52px; min-height:52px; max-height:52px; }
+  .counters { margin-top:10px; }
+}
+
+/* Live progress: the label is the runtime state, the small bar is only its
+   visual position. Both are updated from the pushed row view-model. */
+.nft-table td .scan {
+  display:block;
+  width:auto;
+  height:auto;
+  max-width:160px;
+  padding:0;
+  overflow:visible;
+  border-radius:0;
+  color:var(--text-dim);
+  background:none !important;
+  font-size:11px;
+  font-weight:600;
+  white-space:nowrap;
+}
+.nft-table td .scan-live-bar {
+  display:block;
+  width:116px;
+  height:6px;
+  margin-top:5px;
+  border-radius:999px;
+  background:linear-gradient(90deg,#2a91ff var(--progress,0%),#203850 var(--progress,0%));
+  box-shadow:0 0 5px rgba(42,145,255,.2);
+}
+.nft-table td .scan-live-bar.is-complete {
+  background:linear-gradient(90deg,#27dc83 var(--progress,0%),#203850 var(--progress,0%));
+  box-shadow:0 0 6px rgba(39,220,131,.25);
+}
+.nft-table td .scan-send { color:#6ee7a5; }
+.nft-table td .scan-next { color:#f6cf45; }
+.nft-table td .scan-error,
+.nft-table td .scan-stopped { color:#a9b8ca; }
+
+/* ==================================================================
+   v1.19.27 — final mock polish and vector icon system
+   ================================================================== */
+
+/* Menu icons are masks, so the exact vector stays crisp at every Windows
+   scale and inherits each tab's neon colour. The visible tab text remains
+   plain text for keyboard navigation and automation. */
+.tab::before {
+  content:"" !important;
+  display:block;
+  flex:0 0 21px;
+  width:21px;
+  height:21px;
+  background:currentColor;
+  -webkit-mask-repeat:no-repeat;
+  -webkit-mask-position:center;
+  -webkit-mask-size:contain;
+  mask-repeat:no-repeat;
+  mask-position:center;
+  mask-size:contain;
+}
+.tab[data-tab="ethereum"]::before {
+  transform:none;
+  color:#3b97ff;
+  -webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 1 5.2 12 12 16l6.8-4L12 1Zm0 16.5-6.8-4L12 23l6.8-9.5-6.8 4Z'/%3E%3C/svg%3E");
+  mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 1 5.2 12 12 16l6.8-4L12 1Zm0 16.5-6.8-4L12 23l6.8-9.5-6.8 4Z'/%3E%3C/svg%3E");
+}
+.tab[data-tab="robinhood"]::before {
+  transform:none;
+  color:#20e779;
+  -webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M21 2C11.5 2.4 5.8 7.2 4.2 15.8L2 22l6.2-7.1 2.7 2.3-3.4 3.6C17 18.9 21.1 11.9 21 2Z'/%3E%3C/svg%3E");
+  mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M21 2C11.5 2.4 5.8 7.2 4.2 15.8L2 22l6.2-7.1 2.7 2.3-3.4 3.6C17 18.9 21.1 11.9 21 2Z'/%3E%3C/svg%3E");
+}
+.tab[data-tab="bulk"]::before {
+  transform:none;
+  color:#9bc8ff;
+  -webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M3 4v7.6L12.4 21 21 12.4 11.6 3H4a1 1 0 0 0-1 1Zm5 2a2 2 0 1 1 0 4 2 2 0 0 1 0-4Z'/%3E%3C/svg%3E");
+  mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M3 4v7.6L12.4 21 21 12.4 11.6 3H4a1 1 0 0 0-1 1Zm5 2a2 2 0 1 1 0 4 2 2 0 0 1 0-4Z'/%3E%3C/svg%3E");
+}
+.tab[data-tab="cancel"]::before {
+  color:#9bc8ff;
+  -webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='m5 3-2 2 7 7-7 7 2 2 7-7 7 7 2-2-7-7 7-7-2-2-7 7-7-7Z'/%3E%3C/svg%3E");
+  mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='m5 3-2 2 7 7-7 7 2 2 7-7 7 7 2-2-7-7 7-7-2-2-7 7-7-7Z'/%3E%3C/svg%3E");
+}
+.tab[data-tab="settings"]::before {
+  color:#9bc8ff;
+  -webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='m19.4 13 .1-1-.1-1 2-1.5-2-3.5-2.4 1a8 8 0 0 0-1.7-1L15 3.5h-4L10.7 6A8 8 0 0 0 9 7L6.6 6l-2 3.5 2 1.5-.1 1 .1 1-2 1.5 2 3.5L9 17a8 8 0 0 0 1.7 1l.3 2.5h4l.3-2.5a8 8 0 0 0 1.7-1l2.4 1 2-3.5-2-1.5ZM13 15.5A3.5 3.5 0 1 1 13 8a3.5 3.5 0 0 1 0 7.5Z'/%3E%3C/svg%3E");
+  mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='m19.4 13 .1-1-.1-1 2-1.5-2-3.5-2.4 1a8 8 0 0 0-1.7-1L15 3.5h-4L10.7 6A8 8 0 0 0 9 7L6.6 6l-2 3.5 2 1.5-.1 1 .1 1-2 1.5 2 3.5L9 17a8 8 0 0 0 1.7 1l.3 2.5h4l.3-2.5a8 8 0 0 0 1.7-1l2.4 1 2-3.5-2-1.5-2-1.5ZM13 15.5A3.5 3.5 0 1 1 13 8a3.5 3.5 0 0 1 0 7.5Z'/%3E%3C/svg%3E");
+}
+.tab[data-tab="logs"]::before {
+  color:#a8d0ff;
+  -webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M5 2h11l4 4v16H5V2Zm3 5h6V5H8v2Zm0 4h9V9H8v2Zm0 4h9v-2H8v2Zm0 4h7v-2H8v2Z'/%3E%3C/svg%3E");
+  mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M5 2h11l4 4v16H5V2Zm3 5h6V5H8v2Zm0 4h9V9H8v2Zm0 4h9v-2H8v2Zm0 4h7v-2H8v2Z'/%3E%3C/svg%3E");
+}
+
+.icon-btn { display:grid; place-items:center; padding:0; }
+.icon-btn::before {
+  content:"";
+  width:15px;
+  height:15px;
+  background:currentColor;
+  -webkit-mask-repeat:no-repeat;
+  -webkit-mask-position:center;
+  -webkit-mask-size:contain;
+}
+.icon-start::before { -webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath d='M4 2 17 10 4 18V2Z'/%3E%3C/svg%3E"); }
+.icon-pause::before { -webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath d='M4 2h4v16H4V2Zm8 0h4v16h-4V2Z'/%3E%3C/svg%3E"); }
+.icon-delete::before { -webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath d='M6 2h8l1 2h3v2H2V4h3l1-2Zm-2 6h12l-1 10H5L4 8Zm3 2v6h2v-6H7Zm4 0v6h2v-6h-2Z'/%3E%3C/svg%3E"); }
+
+.table-head .nft-search {
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%239dc2ed' d='M10 3a7 7 0 1 0 4.9 12l5.1 5 1.4-1.4-5-5.1A7 7 0 0 0 10 3Zm0 2a5 5 0 1 1 0 10 5 5 0 0 1 0-10Z'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;
+  background-position:11px center;
+  background-size:18px;
+}
+.table-head::after { content:none; }
+
+/* Segmented live view: the filled segment width is still driven solely by
+   --progress from the row runtime state. */
+.nft-table td .scan-live-bar {
+  /* Default fill; the row runtime state overrides it inline (setProperty).
+     Defined here so the variable has a source in the stylesheet, not only
+     in JS. */
+  --progress: 0%;
+  position:relative;
+  overflow:hidden;
+  background:repeating-linear-gradient(90deg,#203850 0 18px,transparent 18px 21px);
+  box-shadow:none;
+}
+.nft-table td .scan-live-bar::before {
+  content:"";
+  position:absolute;
+  inset:0 auto 0 0;
+  width:var(--progress,0%);
+  border-radius:inherit;
+  background:repeating-linear-gradient(90deg,#2796ff 0 18px,transparent 18px 21px);
+  box-shadow:0 0 7px rgba(39,150,255,.38);
+  transition:width 140ms linear;
+}
+.nft-table td .scan-live-bar.is-complete { background:repeating-linear-gradient(90deg,#203850 0 18px,transparent 18px 21px); }
+.nft-table td .scan-live-bar.is-complete::before { background:repeating-linear-gradient(90deg,#27dc83 0 18px,transparent 18px 21px); }
+
+/* Full light palette for the final mock layout. The geometry is identical to
+   dark; only surfaces and contrast change. */
+:root[data-theme="light"] body {
+  background:radial-gradient(circle at 70% -20%,rgba(55,130,220,.14),transparent 40%),linear-gradient(180deg,#edf5fd,#e6eff8);
+}
+:root[data-theme="light"] .topbar,
+:root[data-theme="light"] .app-footer { background:rgba(244,249,255,.94); border-color:#c8d9ea; }
+:root[data-theme="light"] .tab { color:#405b78; border-right-color:rgba(73,111,149,.16); }
+:root[data-theme="light"] .tab-active,
+:root[data-theme="light"] .tab-active:hover:not(:disabled) {
+  color:#0b4f94;
+  background:linear-gradient(180deg,#eef7ff,#dceeff);
+  border-color:#2e91ef;
+  box-shadow:inset 0 0 16px rgba(46,145,239,.12);
+}
+:root[data-theme="light"] .statusbar { color:#405d7b; }
+:root[data-theme="light"] .panel,
+:root[data-theme="light"] .table-shell { background:linear-gradient(145deg,rgba(255,255,255,.96),rgba(239,247,255,.93)); border-color:#bfd3e7; box-shadow:0 8px 22px rgba(45,83,120,.08); }
+:root[data-theme="light"] .panel-title,
+:root[data-theme="light"] .table-title,
+:root[data-theme="light"] .nft-name { color:#102c48; }
+:root[data-theme="light"] .add-panel .lines-wrap,
+:root[data-theme="light"] .table-head .nft-search,
+:root[data-theme="light"] .row-input,
+:root[data-theme="light"] .icon-btn,
+:root[data-theme="light"] .one-row-scroll button { background:#f5faff; border-color:#bfd3e7; color:#173a5c; }
+:root[data-theme="light"] .table-head { background:rgba(230,241,252,.94); border-color:#bfd3e7; }
+:root[data-theme="light"] .nft-table th { background:#dcebf8; color:#355574; }
+:root[data-theme="light"] .nft-table td { border-bottom-color:#d1e0ee; }
+:root[data-theme="light"] .nft-table tbody tr:nth-child(even) { background:rgba(211,230,247,.26); }
+:root[data-theme="light"] .nft-table tbody tr:hover { background:#e1effb; }
+:root[data-theme="light"] .nft-sub,
+:root[data-theme="light"] .row-index,
+:root[data-theme="light"] .field-label,
+:root[data-theme="light"] .counter-label { color:#58718b; }
+:root[data-theme="light"] .counter { border-right-color:#cfdeec; }
+:root[data-theme="light"] .counters { border-top-color:#cfdeec; }
+:root[data-theme="light"] .nft-table td .scan-live-bar { background:repeating-linear-gradient(90deg,#ceddeb 0 18px,transparent 18px 21px); }
+
+/* Offer SLL / Cancel SLL use the same compact, non-overlapping shell as the
+   dashboard.  The progress card owns the flexible middle area; its list is
+   the only scrolling child.  Completion and destructive controls therefore
+   keep their own space instead of being painted over one another. */
+.sll-tab {
+  display:grid;
+  grid-template-rows:auto auto minmax(0,1fr) auto;
+  align-content:stretch;
+  min-height:0;
+  overflow:hidden;
+}
+.sll-tab > .sll-row {
+  min-width:0;
+  align-items:stretch;
+}
+.sll-tab > .sll-row > .sll-panel { min-width:0; }
+.sll-tab > .progress-panel {
+  min-width:0;
+  min-height:0;
+  overflow:hidden;
+  display:flex;
+  flex-direction:column;
+}
+.sll-tab > .progress-panel .item-list {
+  flex:1 1 auto;
+  min-height:72px;
+  max-height:none;
+  overflow:auto;
+  overscroll-behavior:contain;
+}
+.sll-tab > .progress-panel .result-card {
+  flex:0 0 auto;
+  width:100%;
+  box-sizing:border-box;
+  margin-top:10px;
+}
+.sll-tab > .progress-panel .toolbar-row {
+  flex:0 0 auto;
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top:10px;
+}
+.sll-tab > .progress-panel .toolbar-row .btn { width:auto; min-width:112px; }
+.sll-tab > .danger-panel {
+  width:100%;
+  min-width:0;
+  box-sizing:border-box;
+  padding:10px 14px;
+}
+.sll-tab > .danger-panel .toolbar-row {
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+}
+.sll-tab > .danger-panel .btn {
+  flex:1 1 260px;
+  min-width:0;
+}
+
+@media (max-width:1100px) {
+  .sll-tab { overflow:auto; }
+  .sll-tab > .progress-panel { min-height:340px; }
+}
+
+@media (max-width:900px) {
+  .topbar { padding-inline:10px; }
+  .tab { min-width:0; padding:0 9px; gap:7px; font-size:12px; }
+  .tab::before { width:17px; height:17px; flex-basis:17px; }
+  .content { padding:9px 10px; }
+  .dashboard-top { grid-template-columns:1fr; }
+  .table-head .nft-search { width:min(330px,52vw); }
+  .sll-tab > .progress-panel .toolbar-row .btn,
+  .sll-tab > .danger-panel .btn { flex:1 1 100%; width:100%; }
+}
+
+/* ---- API Key LiveView (Key 1 / Key 2) ----------------------------
+   Số thật từ bot:keyStats. Một thẻ mỗi key; compact trên dashboard là một
+   dòng, đầy đủ trong Settings là hai dòng số + phân bổ. Không có màu nào
+   ngoài badge trạng thái: Active xanh, Nghỉ (cooldown 429) đỏ. */
+.keylive { display:flex; flex-direction:column; gap:6px; margin-top:8px; }
+.keylive .keylive-title { display:flex; align-items:baseline; gap:8px; }
+.keylive .panel-title { margin:0; }
+.keylive-slots { display:flex; flex-wrap:wrap; gap:8px; }
+.keylive-slot {
+  flex:1 1 320px; min-width:280px;
+  border:1px solid var(--border); border-radius:var(--radius);
+  background:var(--bg-elevated); padding:8px 10px;
+  display:flex; flex-direction:column; gap:4px;
+}
+.keylive-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.keylive-name { font-size:13px; font-weight:650; }
+.keylive-fp { font-family:var(--mono); font-size:11px; color:var(--text-dim); }
+.keylive-role { font-size:11px; color:var(--text-dim); }
+.keylive-metrics { display:flex; flex-wrap:wrap; gap:4px 14px; font-size:12px; font-variant-numeric:tabular-nums; }
+.keylive-metric.is-hot { color:var(--yellow); }
+.keylive-dist { font-size:11.5px; color:var(--text-dim); font-variant-numeric:tabular-nums; }
+.keylive-queue { font-variant-numeric:tabular-nums; }
+.keylive.is-compact { margin-top:6px; gap:4px; }
+.keylive.is-compact .keylive-title { display:none; }
+.keylive.is-compact .keylive-slot { flex:1 1 260px; padding:5px 8px; gap:2px; }
+.keylive.is-compact .keylive-dist { display:none; }
+.keylive.is-compact .keylive-metrics { font-size:11.5px; }
+.keylive-host:empty { display:none; }
+
+/* Toolbar glyphs are separate nodes so the button LABEL stays the word. */
+.btn .btn-icon { margin-right:.5em; }
+
+/* ---- NFT row geometry — the ONE place that sets row and cell heights ------
+   Rows were uneven for three layout reasons, not for a too-small --row-h:
+     1. td.cell-nft was display:flex. A <td> that is not display:table-cell
+        leaves table layout: the browser wraps it in an anonymous cell, so its
+        height and its bottom border stop belonging to the row (the line that
+        ran through content, and the row that changed with the picture).
+     2. max-height on a <td> is ignored by table layout, so the State cell
+        (badge + stage + bar) could still push its <tr> taller.
+     3. A <td> height is only a minimum; any taller content grows the row.
+   So every <td> stays a real table cell with one fixed height, and whatever
+   has more than one line lives in a fixed-height box inside it. */
+.nft-table {
+  --cell-ctl-h: 28px;
+}
+.nft-table tbody tr { height: var(--row-h); }
+.nft-table tbody td {
+  box-sizing: border-box;
+  height: var(--row-h);
+  padding: 0 8px;
+  vertical-align: middle;
+  line-height: 18px;
+}
+.nft-table td.cell-select,
+.nft-table td.cell-priority,
+.nft-table td.cell-btn { text-align: center; }
+.nft-table td.cell-select input { display: block; margin: 0 auto; }
+.nft-table .row-index { display: block; line-height: 18px; }
+
+/* NFT: fixed picture slot (kept even with no/failed image) + two fixed lines. */
+.nft-table th.th-nft, .nft-table td.cell-nft { min-width: 180px; }
+.nft-table .nft-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: calc(var(--row-h) - 2px);
+  min-width: 0;
+  overflow: hidden;
+}
+.nft-table .nft-thumb-box {
+  flex: 0 0 36px;
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg-elevated);
+}
+.nft-table .nft-thumb {
+  display: block;
+  width: 36px;
+  height: 36px;
+  margin: 0;
+  border-radius: 6px;
+  object-fit: cover;
+}
+.nft-table .nft-meta { flex: 1 1 auto; min-width: 0; overflow: hidden; }
+.nft-table .nft-name,
+.nft-table .nft-sub {
+  display: block;
+  height: 18px;
+  line-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Min / Max / Step / Phút: one control box. Best / Mine: same line box. */
+.nft-table .row-input {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 82px;
+  height: var(--cell-ctl-h);
+  margin: 0;
+  padding: 0 8px;
+  line-height: calc(var(--cell-ctl-h) - 2px);
+  border-radius: 6px;
+}
+.nft-table td.cell-price { line-height: var(--cell-ctl-h); }
+.nft-table td.cell-btn .icon-btn { width: 30px; height: var(--cell-ctl-h); margin: 0 auto; }
+
+/* State: badge + stage line + bar in a fixed box (20 + 15 + 4 + gaps = 43px). */
+.nft-table .state-box {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  height: calc(var(--row-h) - 4px);
+  min-width: 0;
+  overflow: hidden;
+}
+.nft-table .state-box .status {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  box-sizing: border-box;
+  max-width: 100%;
+  height: 20px;
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nft-table .state-box .scan {
+  flex: 0 0 auto;
+  display: block;
+  height: 15px;
+  max-width: 100%;
+  margin: 0;
+  line-height: 15px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nft-table .state-box .scan-live-bar {
+  flex: 0 0 4px;
+  width: 100%;
+  max-width: 160px;
+  height: 4px;
+  margin: 0;
+}
+
+/* ---- Over-Max row: the WHOLE row turns red ------------------------------
+   (class name kept as row-outbid.) Set ONLY for canonical status OVER_MAX by
+   dashboard-component applyRow. Colour only: no size, padding or border
+   width changes, so the row height and layout never move. A config error
+   (.row-invalid) keeps its own colour. */
+.nft-table tbody tr.row-outbid:not(.row-invalid) > td {
+  background: rgba(190, 36, 36, 0.24);
+  border-bottom-color: #7a2230;
+}
+.nft-table tbody tr.row-outbid:not(.row-invalid):hover > td {
+  background: rgba(190, 36, 36, 0.33);
+}
+.nft-table tbody tr.row-outbid > td:first-child { box-shadow: inset 3px 0 0 #e5484d; }
+.nft-table tbody tr.row-outbid .row-input { border-color: #8c3440; }
+.nft-table tbody tr.row-outbid .nft-name,
+.nft-table tbody tr.row-outbid .row-index,
+.nft-table tbody tr.row-outbid td.cell-price { color: #ffe4e4; }
+.nft-table tbody tr.row-outbid .nft-sub { color: #f0b4b4; }
+.nft-table tbody tr.row-outbid .icon-btn { border-color: #8c3440; }
+:root[data-theme="light"] .nft-table tbody tr.row-outbid:not(.row-invalid) > td {
+  background: #fde3e3;
+  border-bottom-color: #efa6a6;
+}
+:root[data-theme="light"] .nft-table tbody tr.row-outbid:not(.row-invalid):hover > td { background: #fbd3d3; }
+:root[data-theme="light"] .nft-table tbody tr.row-outbid .nft-name,
+:root[data-theme="light"] .nft-table tbody tr.row-outbid .row-index,
+:root[data-theme="light"] .nft-table tbody tr.row-outbid td.cell-price { color: #6b1111; }
+:root[data-theme="light"] .nft-table tbody tr.row-outbid .nft-sub { color: #9a3b3b; }
+:root[data-theme="light"] .nft-table tbody tr.row-outbid .row-input,
+:root[data-theme="light"] .nft-table tbody tr.row-outbid .icon-btn { border-color: #e39a9a; }
+
+/* ---- Offer SLL layout (1.25.6) ---------------------------------------
+   Scoped to the Offer SLL tab (.bulk-tab); the Cancel tab is unchanged.
+   Why the old shell failed:
+     1. The tab was a fixed-height grid (auto auto minmax(0,1fr) auto). When
+        the progress card needed more than its 1fr track - its content, or
+        the 340px floor on narrow windows - it overflowed the track and the
+        danger panel, placed right after the TRACK, was painted over it.
+     2. The progress card was overflow:hidden, so the result card ("Hoàn
+        tất") and the failed-link tools were clipped out of sight.
+     3. .sll-row stretched both setup cards to the taller one's height, so
+        "Cấu hình" carried a large empty area.
+   Now: a normal column. The progress card fills the spare height but never
+   shrinks below its content; when the window is short the TAB scrolls, and
+   the danger panel always follows the content instead of covering it. The
+   NFT result list is the progress card's own scroll area. */
+.sll-tab.bulk-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+.sll-tab.bulk-tab > .dash-head,
+.sll-tab.bulk-tab > .sll-row,
+.sll-tab.bulk-tab > .danger-panel { flex: 0 0 auto; }
+.sll-tab.bulk-tab > .sll-row { align-items: start; }
+.sll-tab.bulk-tab .panel { padding: 12px 14px; }
+
+/* Progress: grows into spare height, never clips what it holds. */
+.sll-tab.bulk-tab > .progress-panel {
+  /* Grows into spare height and shrinks back to its content (min-height:auto
+     keeps it from clipping); the NFT list is what gives way first. */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: visible;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sll-tab.bulk-tab > .progress-panel > * { flex: 0 0 auto; margin-top: 0; margin-bottom: 0; }
+.sll-tab.bulk-tab > .progress-panel .item-list {
+  flex: 1 1 0;
+  min-height: 72px;
+  max-height: 46vh;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.sll-tab.bulk-tab > .progress-panel .item-list:empty { display: none; }
+.sll-tab.bulk-tab > .progress-panel .toolbar-row:empty,
+.sll-tab.bulk-tab > .progress-panel .info-line:empty,
+.sll-tab.bulk-tab > .progress-panel .cancel-progress:empty { display: none; }
+.sll-tab.bulk-tab > .progress-panel .result-card { width: 100%; box-sizing: border-box; }
+.sll-tab.bulk-tab > .danger-panel { padding: 10px 14px; }
+
+/* Controls: one height, one alignment. */
+.sll-tab.bulk-tab {
+  --sll-ctl-h: 32px;
+}
+.sll-tab.bulk-tab .config-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  align-items: end;
+  margin-top: 4px;
+}
+.sll-tab.bulk-tab .config-grid .field { min-width: 0; margin: 0; }
+.sll-tab.bulk-tab .config-grid .field-label {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sll-tab.bulk-tab .config-grid .select-input,
+.sll-tab.bulk-tab .config-grid .num-input {
+  width: 100%;
+  height: var(--sll-ctl-h);
+  box-sizing: border-box;
+}
+.sll-tab.bulk-tab .sll-row .toolbar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+.sll-tab.bulk-tab .sll-row .toolbar-row input[type="file"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: var(--sll-ctl-h);
+  box-sizing: border-box;
+  padding: 3px 6px;
+}
+.sll-tab.bulk-tab .sll-row .toolbar-row .btn {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 96px;
+  height: var(--sll-ctl-h);
+  padding: 0 14px;
+}
+.sll-tab.bulk-tab .sll-row .info-line:empty { display: none; }
+
+/* ---- Ví (1.25.11): configured wallet vs OpenSea session ---------------- */
+.session-wallet-panel .wallet-configured {
+  font-weight: 650;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-wallet-panel .wallet-configured.is-error { color: var(--red); }
+.session-wallet-panel .info-line.is-ok { color: var(--green); }
+.session-wallet-panel .wallet-profile-select { width: 100%; min-width: 0; }

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      Strict CSP: no remote scripts, no eval. Images may load from OpenSea /
+      IPFS gateways so NFT thumbnails render.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; connect-src 'none';"
+    />
+    <title>OpenSea Offer Bot</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!--
+      Load order matters: utils -> shared component -> chain wrappers ->
+      registry -> tabs -> app. Classic scripts, because file:// blocks ES
+      modules in Chromium.
+    -->
+    <script src="theme.js"></script>
+    <!-- The error registry is shared with main, so it is the same file. -->
+    <script src="../error-registry.js"></script>
+    <script src="utils.js"></script>
+    <script src="vocab.js"></script>
+    <script src="key-live.js"></script>
+    <script src="dashboard-component.js"></script>
+    <script src="ethereum-dashboard.js"></script>
+    <script src="robinhood-dashboard.js"></script>
+    <script src="dashboard.js"></script>
+    <script src="settings.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

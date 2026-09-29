@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' ws: wss:;">
+<!--
+  REMOTE MAC = ĐÚNG RENDERER CỦA WINDOWS.
+  Cùng styles.css, cùng dashboard-component (thumbnail, Min/Max/Step sửa tại
+  chỗ, hàng mới lên đầu), cùng tab Offer SLL và Cancel. Khác duy nhất: botAPI
+  là một shim gửi lệnh IPC qua WebSocket tới Windows (remote-app.js).
+-->
+<title>OfferBot Remote</title>
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/remote.css">
+</head>
+<body>
+<section id="pair" class="remote-pair" hidden>
+  <div class="panel remote-pair-card">
+    <div class="panel-title">Ghép nối với Windows</div>
+    <p class="info-line">Mở Windows → Settings → Remote Mac → “Copy mã kết nối”, rồi dán mã vào đây. Chỉ cần làm một lần cho mỗi trình duyệt.</p>
+    <div class="srow">
+      <input id="token" class="text-input" type="password" autocomplete="off" placeholder="Mã ghép nối">
+      <button id="connect" class="btn btn-primary">Kết nối</button>
+    </div>
+    <div id="pairError" class="form-error"></div>
+  </div>
+</section>
+<div id="remoteToast" class="remote-toast" hidden></div>
+<script src="/theme.js"></script>
+<script src="/error-registry.js"></script>
+<script src="/utils.js"></script>
+<script src="/vocab.js"></script>
+<script src="/key-live.js"></script>
+<script src="/dashboard-component.js"></script>
+<script src="/ethereum-dashboard.js"></script>
+<script src="/robinhood-dashboard.js"></script>
+<script src="/dashboard.js"></script>
+<script src="/remote-app.js"></script>
+</body>
+</html>

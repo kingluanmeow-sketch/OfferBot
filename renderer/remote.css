@@ -1,0 +1,60 @@
+/*
+ * remote.css — chỉ những gì khác Windows khi cùng renderer chạy trong trình
+ * duyệt trên Mac. Mọi màu, bảng, trạng thái, nút đến từ styles.css dùng chung.
+ */
+
+/* Trình duyệt Mac: cuộn trang thay vì khung cửa sổ cố định; safe-area cho notch. */
+html, body { height: 100%; }
+body { overflow: auto; -webkit-text-size-adjust: 100%; }
+.app { min-height: 100vh; height: auto; padding-bottom: env(safe-area-inset-bottom); }
+.topbar { position: sticky; top: 0; z-index: 20; flex-wrap: wrap; padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); }
+.tabbar { flex-wrap: wrap; }
+.tab { min-height: 36px; }
+.statusbar { flex: 1 1 100%; }
+.content { overflow: visible; }
+
+/* Bảng NFT: cuộn ngang trên màn nhỏ thay vì bóp cột; hàng cao hơn cho trackpad/ngón tay. */
+.dash-table-wrap, .table-wrap { overflow: auto; -webkit-overflow-scrolling: touch; }
+body.tab-dashboard .content { overflow: visible; }
+.nft-table input.num-input, .nft-table .num-input { min-height: 30px; font-size: 13px; }
+.btn { min-height: 34px; }
+
+/* Ô nhập số trên Mac: hiện rõ là sửa được. */
+.nft-table input:focus, .num-input:focus, .text-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Trạng thái kết nối lên thanh trạng thái bằng màu. */
+body[data-conn="ok"] .statusbar { color: var(--green); }
+body[data-conn="warn"] .statusbar { color: var(--yellow); }
+body[data-conn="bad"] .statusbar { color: var(--red); }
+
+/* Ghép nối */
+.remote-pair { display: flex; justify-content: center; padding: 12vh 16px; }
+.remote-pair-card { max-width: 520px; width: 100%; }
+.remote-pair-card .srow { margin-top: 10px; }
+.remote-pair-card .text-input { flex: 1 1 auto; }
+
+/* Toast */
+.remote-toast { position: fixed; left: 50%; bottom: max(18px, env(safe-area-inset-bottom)); transform: translateX(-50%); background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text); padding: 10px 14px; border-radius: var(--radius); z-index: 100; max-width: min(92vw, 560px); font-size: 13px; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+.remote-toast.err { border-color: var(--red); }
+
+/* Logs */
+.logs-tab .log-box { max-height: 70vh; overflow: auto; font-family: var(--mono); font-size: 12px; }
+
+/* Màn nhỏ (iPad dọc / cửa sổ hẹp) */
+@media (max-width: 900px) {
+  .content { padding: 10px; }
+  .brand { font-size: 13px; }
+}
+
+/* ---- Khối thống kê: 6 ô trên MỘT hàng, gọn chiều cao để bảng NFT có thêm chỗ ---- */
+.panel.toolbar { padding-bottom: 6px; }
+.panel.toolbar .counters { flex: 0 0 auto; display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); grid-auto-rows: max-content; align-content: start; gap: 6px; margin-top: 8px; border-top: 0; }
+.panel.toolbar .counter { min-width: 0; flex-direction: row; align-items: baseline; justify-content: space-between; gap: 6px; padding: 4px 8px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; }
+.panel.toolbar .counter-label { font-size: 10.5px; letter-spacing: 0; text-transform: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.panel.toolbar .counter b { font-size: 14px; margin-left: 0; flex: 0 0 auto; }
+@media (max-width: 760px) { .panel.toolbar .counters { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+
+/* ---- Ảnh NFT bấm được (mở OpenSea), tên bấm đúp để copy ---- */
+.nft-table img.nft-thumb { cursor: pointer; transition: transform .12s ease, box-shadow .12s ease; }
+.nft-table img.nft-thumb:hover { transform: scale(1.06); box-shadow: 0 0 0 2px var(--accent); }
+.nft-table .nft-name { cursor: copy; }

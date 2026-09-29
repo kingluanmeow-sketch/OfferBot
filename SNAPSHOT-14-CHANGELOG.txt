@@ -1,0 +1,25 @@
+OfferBot Snapshot 14 — v1.25.18-test.6
+
+Base: published Snapshot 13 source ZIP v1.25.18-test.4 (SHA256 E8D2DB08FB8E3FF2F62FD9A9AB776CC7A0888A0EB5EF6E89C2CADF7A159BFB55).
+The subsequently published v1.25.18-test.5 was a version-only successor to Snapshot 13.
+
+Changes:
+- Removed the unconditional five-second WARM NFT shadow REST poll. Targeted evidence-based recovery remains.
+- When a newer Stream event fences an in-flight own-authority read, a waiting send immediately receives a new targeted read owner instead of waiting for watchdog repair.
+
+Verification:
+- Targeted recovery lifecycle regression: PASS (no live network).
+- Stream A/B architecture: 6/6 PASS.
+- Path A/B, self-cancel, stale REST, reconnect independence, latency telemetry: 10/10 PASS.
+- Offer Item stress: 16/16 PASS (including 1,000 NFTs, 100,000 events, 1,000 reset cycles).
+- Packaged runtime: 16/16 PASS against the exact final app.asar and unpacked EXE.
+
+Installer: OpenSea-Offer-Bot-1.25.18-test.6-snapshot-14.exe
+Installer size: 75,961,502 bytes
+Installer SHA256: DBA227571064233B239BDFEDA2B53CE18549E17A3897C8D6BF50F3676BA1B84C
+app.asar SHA256: ECABA29D308E57877BDD08EE92B8C32D2793E15A50B300F707C72DED1A5D845A
+Windows Authenticode: NotSigned
+
+No real-money order was submitted during validation. Production OpenSea behavior
+and long-duration 24/7 reliability remain unverified. Stable v1.25.17 and its
+latest.yml remain unchanged.

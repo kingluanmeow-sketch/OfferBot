@@ -1,0 +1,17 @@
+OfferBot Snapshot 16 — v1.25.18-test.8
+
+Snapshot 15 / v1.25.18-test.7 remains preserved as the rollback candidate.
+
+Changes:
+- Keep Path A open during reconnect and degraded-feed recovery; do not close warm NFT send gates for background sweeps.
+- Run reconnect recovery per collection after its join/gap ACK instead of duplicating it with a global socket reconnect sweep; stage per-NFT reads at a bounded rate.
+- Coalesce confirmed full degraded-feed recovery sweeps for 60 seconds. Healthy WARM NFTs receive no periodic authority sweep.
+- When a top item order is removed, continue using a still-known collection or trait Best immediately; gate only the affected NFT when no local external Best remains.
+- A fresh higher Stream order clears that NFT's downward-authority gate while its targeted Path B read is pending.
+- Expose bounded Path B queue state in engine diagnostics.
+- Clear engine recovery and bridge UI/name timers during reset, suspend, and app shutdown.
+- Extend packaged renderer checks for live Best/Mine/pause/error updates and stable table/row identity with 120 rows.
+
+Validation and artifact hashes are recorded in the release manifest after the final build.
+
+This is a prerelease. Real OpenSea production behavior and 24/7 reliability are not yet proven. Stable auto-update metadata must remain unchanged.

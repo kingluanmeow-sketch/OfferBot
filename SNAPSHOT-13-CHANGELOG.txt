@@ -1,0 +1,25 @@
+OfferBot Snapshot 13 — v1.25.18-test.4
+
+Installer: OpenSea-Offer-Bot-1.25.18-test.4-snapshot-13.exe
+Installer size: 75,962,327 bytes
+Installer SHA256: 1CC13F6FA0F20589B961043F4CFB85812663A9E161F5B100FECEBD0FD78A939B
+app.asar SHA256: CB1C8920E6C5A9466E380CDD489EFFD39B843CA7436B2049254BAB3001E67B60
+Windows Authenticode: NotSigned
+
+Runtime changes from Snapshot 12:
+- Normal Stream mode now subscribes only to tracked collection topics; collection:* is an explicit diagnostic opt-in.
+- Per-collection joins request the supported Offer Item event types.
+- Stream ingress frames, bytes, handled events, and local drops are available in diagnostics.
+- Short-lived socket closes preserve exponential reconnect backoff; it resets only after a stable, transport-proven connection.
+- A manual own-order cancel wakes its tracked NFT immediately, uses known local external Best for Path A, and queues a separate targeted full Path B read.
+- A recovery snapshot is discarded when the per-NFT Stream revision advanced after that read began.
+- Added bounded latency spans from raw frame receive through decode/map/Book/Decision/Intent/quota/HTTP start.
+
+Verification:
+- Stream A/B regression: 6/6.
+- Path A/B, self-cancel, stale recovery, reconnect independence, and latency telemetry: 10/10.
+- Offer Item stress: 16/16, including 1,000 tracked NFTs, 100,000 Stream events, bounded books/metrics, and 1,000 reset cycles.
+- Packaged runtime: 16/16; dependency closure, Offer Item UI, Add NFT controls, per-collection Stream mode, and absence of SLL/Cancel/Bulk entrypoints.
+- Synthetic replay of supplied 60-second counts: 1,535,583 global frames reduced to 41,789 tracked frames (97.28% fewer JS frames); equal-size fixture modeled 36.75x ingress bytes. This is not a live OpenSea A/B measurement and does not establish the cause of code 1006 disconnects.
+
+Production OpenSea behavior has not been verified after this change. Long-duration soak and 24/7 reliability are not proven. Windows installer is unsigned.
