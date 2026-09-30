@@ -23,6 +23,8 @@ const suites = [
   { file: "production-trace-test.js" },
   { file: "stream-ab-architecture-test.js" },
   { file: "offer-item-v2-ab-selfcancel-test.js" },
+  { file: "own-remove-grace-test.js" },
+  { file: "priority-inversion-flight-test.js" },
   { file: "offer-item-v2-stress-test.js" },
   { file: "update-test.js", electron: true }
 ];

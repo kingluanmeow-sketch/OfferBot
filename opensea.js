@@ -359,7 +359,25 @@ function describeError(error) {
 async function request(options) {
   if ((options.method || "get").toLowerCase() !== "get") return requestOnce(options);
   const domain = require("crypto").createHash("sha256").update(String(options.apiKey ?? apiKeys.fingerprint())).digest("hex");
-  const key = JSON.stringify([domain, options.url, options.params || {}, options.kind || KIND.READ]);
+  /**
+   * FLIGHT KEY MANG THEO HẠNG ƯU TIÊN (1.25.33)
+   *
+   *   Trước đây key gộp KHÔNG có priority: một lượt INITIAL tới ngay sau một
+   *   lượt P2 nền cùng URL chỉ "join" vào lượt P2 đó — request thật DUY NHẤT
+   *   đã đi với priority P2, INITIAL mất hẳn ưu tiên của chính nó (đo live
+   *   2026-09-30, cold-start: 32/309 lượt INITIAL có ít nhất 1 trang bị tính
+   *   priority=2 tại readDispatcher.acquire, có lượt cả 6 trang đều vậy).
+   *
+   *   Tách flight theo 2 hạng (urgent = INITIAL/P0/P1, nền = P2/P3) thay vì
+   *   theo priority riêng lẻ: dedupe vẫn hoạt động đầy đủ TRONG một hạng (hai
+   *   lượt P2 cùng URL vẫn gộp làm một, hai lượt INITIAL cùng URL vẫn gộp làm
+   *   một) — chỉ khi một lượt urgent và một lượt nền trùng URL mới tách thành
+   *   2 request thật, tối đa gấp đôi trong đúng tình huống hiếm đó, không có
+   *   nguy cơ storm không giới hạn.
+   */
+  const priority = options.priority ?? PRIORITY.P0;
+  const tier = priority > rateLimiter.URGENT_PRIORITY ? "bg" : "urgent";
+  const key = JSON.stringify([domain, options.url, options.params || {}, options.kind || KIND.READ, tier]);
   return readFlights.run(key, signal => requestOnce({...options, signal}), options.signal);
 }
 async function requestOnce(options) {
