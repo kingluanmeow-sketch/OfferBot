@@ -101,7 +101,11 @@ const RECOVER_EVERY_MS = 3000;
 // Owner 2026-09-30 (final): dashboard ceilings at 90%, keys not added.
 const WRITE_CAPS = [2 * 0.9, 1 * 0.9];
 const WRITE_START = [2 * 0.9, 1 * 0.9];
-const WRITE_BURSTS = [2, 1];
+// 1.25.32: the two keys are two DIFFERENT OpenSea accounts (owner-confirmed):
+// independent pools, aggregate 1.8 + 0.9 = 2.7/s. Burst 1 per key so no
+// one-second window exceeds a dashboard rate (Key 1 2/s, Key 2 1/s).
+const WRITE_BURSTS = [1, 1];
+const GRANT_WINDOW_MS = 60000;
 
 function fingerprint(apiKey) {
   const raw = String(apiKey || "").trim();
@@ -532,13 +536,8 @@ class QuotaBroker extends EventEmitter {
     this.model = new QuotaModel({ startRps });
     /** Một AIMD controller cho mỗi API-key fingerprint/quota domain. */
     this.models = new Map([["default", this.model]]);
-    /**
-     * 1.25.31 dashboard ceilings for order posting: Key 1 2/s, Key 2 1/s, and
-     * OpenSea may share self-serve limits across an account's keys. Run at
-     * 80%: per-key caps by position in the request's domain list, plus one
-     * shared model every grant must also pass.
-     */
-    this.shared = new QuotaModel({ startRps: 2 * 0.9, burst: 1, rateCeiling: 2 * 0.9 });
+    /** Per-domain grant timestamps (60 s) for instrumentation. */
+    this.grantLogs = new Map();
     this.queue = new FairQueue();
 
     /** Yêu cầu của CHÍNH tiến trình này đang chờ trả lời (khi là follower). */
@@ -837,8 +836,7 @@ class QuotaBroker extends EventEmitter {
   applyReport(msg) {
     const model = this.modelFor(msg.domain);
     if (msg.headers) model.learn(msg.headers);
-    // A 429 on a possibly shared account pool slows every key.
-    if (msg.retryAfterMs || Number(msg.status) === 429) this.shared.observe({ status: 429 });
+    // Independent accounts: a 429 slows only the key that received it.
     if (msg.retryAfterMs) {
       model.penalize(msg.retryAfterMs);
       this.log(`429 → chặn domain ${msg.domain || "default"} ${msg.retryAfterMs}ms cho mọi tiến trình`);
@@ -951,7 +949,6 @@ class QuotaBroker extends EventEmitter {
   }
 
   pickDomain(req, mono = QuotaModel.mono()) {
-    if (!this.shared.check(mono).ok) return null;
     let best = null, bestModel = null;
     const list = this.domainsOf(req);
     for (let i = 0; i < list.length; i++) {
@@ -969,16 +966,14 @@ class QuotaBroker extends EventEmitter {
 
   /** Thời gian chờ ngắn nhất tới khi BẤT KỲ domain nào của yêu cầu ghi được. */
   waitFor(req, mono = QuotaModel.mono()) {
-    const shared = this.shared.check(mono);
-    const sharedWait = shared.ok ? 0 : Math.max(1, Number(shared.waitMs) || 20);
     let wait = Infinity;
     const list = this.domainsOf(req);
     for (let i = 0; i < list.length; i++) {
       const check = this.capModel(this.modelFor(list[i]), i).check(mono);
-      if (check.ok) return sharedWait;
+      if (check.ok) return 0;
       wait = Math.min(wait, Math.max(1, Number(check.waitMs) || 20));
     }
-    return Math.max(wait, sharedWait);
+    return wait;
   }
 
   nextQueueWait() {
@@ -995,13 +990,33 @@ class QuotaBroker extends EventEmitter {
     return Number.isFinite(wait) ? wait : 20;
   }
 
+  /** Per-domain write capacity and grants over the last 60 s. */
+  grantRates() {
+    const now = Date.now();
+    const out = {};
+    for (const [domain, model] of this.models) {
+      if (domain === "default" && !this.grantLogs.has(domain)) continue;
+      const log = this.grantLogs.get(domain) || [];
+      while (log.length && now - log[0] > GRANT_WINDOW_MS) log.shift();
+      out[domain] = { ceilingRps: model.rateCeiling, rate: Math.round(model.rate * 100) / 100,
+        grants60s: log.length, grantsPerSec: +(log.length / 60).toFixed(2),
+        utilization: model.rateCeiling ? +(log.length / 60 / model.rateCeiling).toFixed(2) : 0,
+        rateLimits: model.rateLimits, blockedForMs: model.snapshot().blockedForMs };
+    }
+    return out;
+  }
+
   /** Cấp cho một yêu cầu: chọn domain + trừ gáo NGUYÊN TỬ. */
   grantOne(req) {
     const domain = this.pickDomain(req);
     if (!domain) return null;
     const model = this.modelFor(domain);
     if (!model.take()) return null;
-    this.shared.take();
+    const now = Date.now();
+    let log = this.grantLogs.get(domain);
+    if (!log) { log = []; this.grantLogs.set(domain, log); }
+    log.push(now);
+    while (log.length && now - log[0] > GRANT_WINDOW_MS) log.shift();
     this.stats.granted++;
     this.stats.grantsByDomain = this.stats.grantsByDomain || {};
     this.stats.grantsByDomain[domain] = (this.stats.grantsByDomain[domain] || 0) + 1;

@@ -5369,7 +5369,7 @@ class OfferItemEngineV2 {
     const census = this.intents.census();
     return {
       lastMinute: n.last || n.window, total: n.total, perKey: n.perKey,
-      quotaWaitMs: { p50: pct(0.5), p95: pct(0.95), p99: pct(0.99), samples: sorted.length },
+      quotaWaitMs: { p50: pct(0.5), p95: pct(0.95), p99: pct(0.99), max: sorted.length ? sorted[sorted.length - 1] : 0, samples: sorted.length },
       writeQueue: { ready: this.intents.ready().length, acquiring: this.acquiring, inFlight: census.inFlight,
         waiting: census.byState.WAITING || 0 },
       recovery: this.recovery.census(),

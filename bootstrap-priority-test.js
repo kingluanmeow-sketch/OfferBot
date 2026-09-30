@@ -92,7 +92,7 @@ const tick = () => new Promise(r => setImmediate(r));
     const keys = { pool, find: k => pool.find(e => e.key === k), leaseKey: () => ({ release() {} }) };
     let t = 0;
     const d = new ReadDispatcher({ keys, now: () => t });
-    d.global.tokens = 0;
+    d.state("a").tokens = 0; d.state("b").tokens = 0;
     const order = [];
     const jobs = [
       d.acquire({ priority: PRIORITY.P2 }).then(l => { order.push("background"); l.release(); }),

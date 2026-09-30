@@ -1439,7 +1439,25 @@ function startHousekeeping() {
         quota = ` · READ quota used=${rs.global.usedRps60s}/${rs.global.ceilingRps}rps (${Math.round(rs.global.utilization * 100)}%) ` +
           `q=${rs.queued}(crit=${rs.queuedCritical} bg=${rs.queuedBackground}) wait all p50/p95/max=${rs.waitMs.p50}/${rs.waitMs.p95}/${rs.waitMs.max}ms realtime p50/p95/max=${rs.realtimeWaitMs.p50}/${rs.realtimeWaitMs.p95}/${rs.realtimeWaitMs.max}ms ` +
           `429 60s/total=${rs.global.rateLimited60s}/${rs.global.rateLimitedTotal} ` +
-          `keys[${rs.keys.map(k => `cap${k.capRps}:${k.rps.toFixed(2)}/${k.capRps}rps g${k.grants} 429x${k.rateLimited}`).join(" ")}]`;
+          `independent=${rs.global.independentKeys} keys[${rs.keys.map(k => `cap${k.capRps}:${k.usedRps60s}/${k.capRps}rps util=${Math.round(k.utilization * 100)}% aimd=${k.rps.toFixed(2)} 429x${k.rateLimited}`).join(" ")}]`;
+        // WRITE: one broker serves all chains; print it once.
+        for (const [, bridge] of engines) {
+          const eng = bridge && bridge.engine ? bridge.engine : bridge;
+          const q = eng && eng.quota;
+          if (!q || typeof q.grantRates !== "function") continue;
+          const gr = q.grantRates();
+          const st = q.status();
+          const doms = Object.values(gr).sort((a, b) => b.ceilingRps - a.ceilingRps);
+          const cap = doms.reduce((n, d) => n + d.ceilingRps, 0);
+          const total = doms.reduce((n, d) => n + d.grants60s, 0);
+          const nd = typeof eng.netDiagnostics === "function" ? eng.netDiagnostics() : null;
+          const w = nd && nd.quotaWaitMs ? nd.quotaWaitMs : null;
+          quota += ` · WRITE grants=${(total / 60).toFixed(2)}/${cap.toFixed(1)}rps (${cap ? Math.round(total / 60 / cap * 100) : 0}%) ` +
+            `keys[${doms.map(d => `cap${d.ceilingRps}:${d.grantsPerSec}/${d.ceilingRps}rps util=${Math.round(d.utilization * 100)}% aimd=${d.rate} 429x${d.rateLimits} cd=${d.blockedForMs}ms`).join(" ")}] ` +
+            `queue now/peak=${st.queued}/${st.queuedPeak || 0} oldest=${st.oldestQueuedAt ? Date.now() - st.oldestQueuedAt : 0}ms` +
+            (w ? ` Decision->grant p50/p95/max=${w.p50}/${w.p95}/${w.max}ms` : "");
+          break;
+        }
         for (const [chain, bridge] of engines) {
           const eng = bridge && bridge.engine ? bridge.engine : bridge;
           const s = (eng && eng.stats) || {};
