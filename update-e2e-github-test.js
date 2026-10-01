@@ -30,7 +30,16 @@ const crypto = require("crypto");
 const ROOT = __dirname;
 const PROFILE = fs.mkdtempSync(path.join(os.tmpdir(), "osb-update-e2e-"));
 const { app } = require("electron");
+// Without an explicit name, Electron falls back to the generic "Electron"
+// app identity in dev mode, and electron-updater's download cache keys off
+// app.getPath("appData")/app.name -- NOT userData -- so without this the
+// downloaded installer lands in the shared %LOCALAPPDATA%\Electron\pending
+// cache instead of staying isolated under this harness's own throwaway
+// profile. Give it a harness-specific name so nothing it does can ever
+// collide with the real app's own identity/cache/update state.
+app.setName("OfferBotUpdateE2EHarness");
 app.setPath("userData", PROFILE);
+app.setPath("appData", PROFILE);
 
 const pkg = require(path.join(ROOT, "package.json"));
 const TARGET_VERSION = pkg.version;
@@ -66,6 +75,13 @@ async function runForBaseline(baselineVersion) {
   autoUpdater.logger = { info: m => log(`[eu:${baselineVersion}] ${m}`), warn: m => log(`[eu:${baselineVersion}] WARN ${m}`), error: m => log(`[eu:${baselineVersion}] ERROR ${m}`), debug() {} };
   autoUpdater.autoDownload = false;
   autoUpdater.allowPrerelease = false;
+  // CRITICAL: electron-updater defaults autoInstallOnAppQuit to true. This
+  // harness downloads a REAL installer and must never let app.exit() below
+  // trigger a real silent install (--updated,/S) of it. Confirmed on
+  // 2026-10-01: a run without this line fired an actual silent install
+  // attempt on app.exit() (blocked only because the real app's files were
+  // locked by an already-running instance -- do not rely on that).
+  autoUpdater.autoInstallOnAppQuit = false;
   // Real GitHub endpoint -- no mocking. app.isPackaged is false under this
   // harness, so electron-updater needs an explicit opt-in to actually hit
   // the network instead of silently no-op'ing ("not packed and dev update
@@ -128,6 +144,11 @@ async function runForBaseline(baselineVersion) {
 }
 
 (async () => {
+  // electron-updater's network layer (checkForUpdates/downloadUpdate) relies
+  // on Electron internals (net/session) that are only available once the app
+  // is ready -- without this the real-network calls below hang forever with
+  // no error and no timeout, instead of failing fast.
+  await app.whenReady();
   log(`update-e2e-github-test.js starting -- target release=${TARGET_VERSION} baselines=${BASELINE_VERSIONS.join(",")}`);
   log(`feed: github.com/${pkg.build.publish[0].owner}/${pkg.build.publish[0].repo} (releases/latest)`);
   for (const v of BASELINE_VERSIONS) {
@@ -146,5 +167,7 @@ async function runForBaseline(baselineVersion) {
 
   try { fs.rmSync(PROFILE, { recursive: true, force: true }); } catch { /* best effort cleanup */ }
 
-  if (failed) process.exitCode = 1;
+  // Nothing ever opens a window or calls quit, so Electron's event loop
+  // would otherwise keep the process alive forever after this IIFE settles.
+  app.exit(failed ? 1 : 0);
 })();
