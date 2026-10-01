@@ -208,7 +208,15 @@ const RETRY_POLICY = {
   "not-sent": { base: 500,  max: 5000 },
   server:    { base: 1000, max: 15000 },
   ambiguous: { base: 1000, max: 10000 },
-  generic:   { base: 3000, max: 30000 }
+  generic:   { base: 3000, max: 30000 },
+  // 1.25.44: a provisional order that fails BOTH bounded own-confirm checks
+  // can, per-cycle, legitimately SEND again (each cycle is itself bounded --
+  // see the tri-state confirmed fix). Without its own escalating backoff, a
+  // persistently-unfunded/never-Best own order can cycle POST -> provisional
+  // -> fail -> POST indefinitely, each cycle individually bounded but the
+  // SEQUENCE unbounded. `row.ownConfirmFailStreak` (NOT row.failures, which
+  // POST 2xx resets every cycle) escalates this specific backoff.
+  "own-confirm-failed": { base: 5000, max: 60000 }
 };
 const RETRY_BASE_MS = RETRY_POLICY.generic.base;
 const RETRY_MAX_MS = RETRY_POLICY.generic.max;
@@ -556,6 +564,16 @@ class OfferItemEngineV2 {
      * before. See deferForOwnSync.
      */
     this.ownWaitTimers = new Map();
+    /**
+     * tokenKey -> timer, for scheduleOwnConfirmation's bounded post-submit
+     * check (1.25.42). Same registry discipline as ownWaitTimers/
+     * firstReadTimers: a key only ever holds the MOST RECENT confirmation
+     * timer (a newer recordOwnOrder/reprice for the same NFT supersedes and
+     * clears any older one -- the old hash's confirmation no longer matters
+     * once a new order replaces it), and is cleared on removeRow/reset so
+     * nothing outlives the row or a wallet switch.
+     */
+    this.ownConfirmTimers = new Map();
     /** tokenKey -> timer hẹn đọc lại lượt đầu; để reset dọn và watchdog biết. */
     this.firstReadTimers = new Map();
     /** tokenKey -> lần cuối đọc lại vì top bị huỷ (gap recovery). */
@@ -1518,6 +1536,8 @@ class OfferItemEngineV2 {
     this.firstReadTimers.clear();
     for (const timer of this.ownWaitTimers.values()) clearTimeout(timer);
     this.ownWaitTimers.clear();
+    for (const timer of this.ownConfirmTimers.values()) clearTimeout(timer);
+    this.ownConfirmTimers.clear();
     this.inFlightSince.clear();
     for (const pr of this.pendingReads.values()) if (pr.timer) clearTimeout(pr.timer);
     this.pendingReads.clear();
@@ -1599,6 +1619,9 @@ class OfferItemEngineV2 {
     const owt = this.ownWaitTimers.get(key);
     if (owt) clearTimeout(owt);
     this.ownWaitTimers.delete(key);
+    const oct = this.ownConfirmTimers.get(key);
+    if (oct) clearTimeout(oct);
+    this.ownConfirmTimers.delete(key);
     this.clearHydrating(key);
     this.awaitingFirstRead.delete(key);
     this.downwardAuthority.delete(key);
@@ -2165,6 +2188,52 @@ class OfferItemEngineV2 {
     if (verdict.status === STATUS.ON_TOP || verdict.status === STATUS.ABOVE_MAX) this.bootstrapMark(key, "terminalAt", Date.now(), verdict.status);
 
     if (verdict.status !== STATUS.SEND) {
+      /**
+       * PROVISIONAL-ONLY ON_TOP KHÔNG PHẢI TRẠNG THÁI AN TOÀN (1.25.42)
+       *
+       *   `mine` ở trên GỒM CẢ own order còn `confirmed:false` (provisional,
+       *   mới POST) -- đúng, có chủ ý, để chống gửi trùng/tự-vượt-giá tức
+       *   thời (không đổi `ownBest()`/decide() ở trên). NHƯNG nếu order
+       *   provisional đó là THỨ DUY NHẤT làm `mine >= best`, ON_TOP ở đây là
+       *   MỘT KẾT LUẬN CHƯA ĐƯỢC CHỨNG MINH: POST 2xx/"status":"ACTIVE" đo
+       *   thật KHÔNG chứng minh được tính vào Best (500 order ACTIVE/17.999
+       *   WETH). Tính lại ĐÚNG CÙNG verdict nhưng chỉ với own ĐÃ xác nhận
+       *   (`confirmedOnly`, xem scheduleOwnConfirmation) -- nếu không còn
+       *   ON_TOP khi bỏ phần provisional, hàng này KHÔNG được coi là xong:
+       *   giữ WAITING thấy rõ, không gửi trùng (mine provisional đã đủ cao),
+       *   và để scheduleOwnConfirmation tự re-evaluate khi có kết quả thật
+       *   (không phụ thuộc watchdog cho tiến trình bình thường).
+       */
+      if (verdict.status === STATUS.ON_TOP) {
+        const mineConfirmed = book.ownBest(receivedAt, { confirmedOnly: true });
+        if (mineConfirmed.price !== mine.price) {
+          const verdictConfirmed = decide({
+            best: best.price, mine: mineConfirmed.price,
+            minPrice: row.minPrice, maxPrice: row.maxPrice, step: row.step
+          });
+          if (verdictConfirmed.status !== STATUS.ON_TOP) {
+            this.stats.ownTopUnconfirmed = (this.stats.ownTopUnconfirmed || 0) + 1;
+            // setState() is a no-op if no intent entry exists yet (same
+            // invariant as the SEND path above) -- a row that goes straight
+            // to ON_TOP without ever having sent has no entry, so create one
+            // first or the WAITING state silently never gets recorded.
+            if (!this.intents.get(key)) {
+              this.intents.set(key, {
+                target: mine.price, best: best.price, mine: mine.price,
+                generation: book.generation, reason: "own-confirm-pending", at: receivedAt
+              });
+            }
+            this.setIntent(key, INTENT.WAITING, {
+              dependency: "own-confirm", lastError: "own-pending-confirmation", waitingSince: Date.now()
+            });
+            productionTrace.record("blocked", event, {
+              chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+              status: "WAITING", reason: "own-state-unknown", target: mine.price
+            });
+            return;
+          }
+        }
+      }
       if (verdict.status === STATUS.BAD_CONFIG && row.lastError !== verdict.reason) {
         row.lastError = verdict.reason;
         this.log(`#${row.tokenId} ${verdict.reason}`);
@@ -2991,31 +3060,57 @@ class OfferItemEngineV2 {
       const msg = String(error && error.message || error).slice(0, 120);
       this.metrics.get(traceId)?.fail("http");
       this.metrics.finish(traceId);
-      productionTrace.record("submit_failure", { correlationId: first.correlationId || traceId }, {
-        chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
-        status: "FAILED", reason: "http", target
-      });
       /**
-       * CHẮC CHẮN CHƯA GỬI vs CÓ THỂ ĐÃ TỚI SERVER
+       * CHẮC CHẮN CHƯA GỬI vs CÓ THỂ ĐÃ TỚI SERVER (1.25.44: hai nhánh ghi
+       * hai trạng thái terminal KHÁC NHAU -- trước đây cả hai đều ghi
+       * "submit_failure"/FAILED/http chung một chỗ phía trên, nên không thể
+       * phân biệt "chắc chắn chưa gửi" với "có thể đã tới server" chỉ từ
+       * trace; đó là một phần lý do audit không đếm được rạch ròi 3 kết quả
+       * terminal mà chỉ thấy http_start thiếu cặp).
        *
        *   HttpPool đánh dấu `notSent` khi body chưa rời máy trọn vẹn (lỗi
        *   DNS/kết nối/huỷ trước khi ghi xong). Khi đó không thể có order nào
-       *   ở server: thử lại nhanh. Ngược lại (timeout sau khi đã gửi, socket
-       *   rớt giữa chừng) thì order CÓ THỂ đã được nhận: không gửi lại mù —
-       *   đánh dấu own của RIÊNG hàng này là mơ hồ; lượt thử lại sẽ chờ một
-       *   lượt đọc đối soát đúng token đó trước khi dựng order mới.
+       *   ở server: thử lại nhanh, DEFINITELY_NOT_SENT. Ngược lại (timeout
+       *   sau khi đã gửi, socket rớt giữa chừng) thì order CÓ THỂ đã được
+       *   nhận: không gửi lại mù — AMBIGUOUS_OUTCOME, đánh dấu own của
+       *   RIÊNG hàng này là mơ hồ; lượt thử lại sẽ chờ một lượt đọc đối
+       *   soát đúng token đó trước khi dựng order mới.
        */
       if (error && error.notSent === true) {
         this.netStat("notSent", 1);
+        productionTrace.record("submit_failure", { correlationId: first.correlationId || traceId }, {
+          chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+          status: "FAILED", reason: "not-sent", target
+        });
         this.log(`[SEND] SUBMIT NOT SENT NFT #${row.tokenId} ${msg} — thử lại nhanh`);
         this.scheduleRetry(key, 0, msg, "not-sent");
         return;
       }
       if (bookNow) bookNow.ownUnknownAt = Date.now();
       this.netStat("ambiguous", 1);
+      productionTrace.record("submit_ambiguous", { correlationId: first.correlationId || traceId }, {
+        chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+        status: "AMBIGUOUS_OUTCOME", reason: "ambiguous", target
+      });
       this.log(`[SEND] SUBMIT AMBIGUOUS NFT #${row.tokenId} ${msg} — đối soát token trước khi gửi lại`);
-      this.queueRead(row, { reason: "post-uncertain", authoritative: false, readAt: Date.now(), firstRead: false, attempt: 1 });
-      this.scheduleRetry(key, 0, msg, "ambiguous");
+      /**
+       * UI PHẢI NÓI ĐÚNG "ĐANG ĐỐI CHIẾU", NGAY, KHÔNG PHẢI SAU MỘT BACKOFF
+       * (1.25.45)
+       *
+       *   `scheduleRetry` đặt INTENT.RETRY — `bridge.js scanStateOf()` đọc đó
+       *   thành "RETRYING" (gợi ý một lỗi tạm thời sẽ tự thử lại), và chỉ sau
+       *   khi backoff hết, lượt submit KẾ TIẾP mới chạm `ownAuthoritative()`/
+       *   `deferForOwnSync()` — cơ chế WAITING/"post-reconcile" đã có sẵn
+       *   TỪ TRƯỚC (bridge.js đã có nhánh POST_RECONCILE chờ đúng
+       *   `dependency==="post-reconcile"`, nhưng không nhánh gửi nào từng đặt
+       *   nó ngay lúc này). Gọi `deferForOwnSync` NGAY thay vì `scheduleRetry`:
+       *   WAITING + dependency "post-reconcile" hiện ra tức thì, và lượt đọc
+       *   đối soát đúng token này (deferForOwnSync tự xếp, vì `rowAmbiguous`
+       *   đã true nhờ `ownUnknownAt` vừa đặt trên) tự `evaluate()+pump()`
+       *   khi xong (`settle()`, đã có từ trước) — chuyển đúng sang gửi lại /
+       *   terminal mà không cần qua RETRY/backoff trước.
+       */
+      this.deferForOwnSync(key, row, first.correlationId || traceId, "post-uncertain");
       return;
     }
     this.lastPostAt = Date.now();
@@ -3051,14 +3146,16 @@ class OfferItemEngineV2 {
         }
         // Watchdog đã thay lượt này trong lúc POST bay — nhưng OpenSea ĐÃ nhận
         // order: vẫn phải ghi own, nếu không lượt mới sẽ gửi chồng.
-        this.recordOwnOrder(bookNow, posted.orderHash || signed.orderHash, target, durationMinutes,
+        const postedHashOld = posted.orderHash || signed.orderHash;
+        this.recordOwnOrder(bookNow, postedHashOld, target, durationMinutes,
           Number(signed.components && signed.components.endTime) || 0, first.correlationId || traceId);
         this.bootstrapMark(key, "successAt", Date.now(), "SUCCESS");
         productionTrace.record("submit_success", { correlationId: first.correlationId || traceId }, {
           chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
-          status: "SUCCESS", mine: target, max: row.maxPrice, target
+          status: "PROVISIONAL", reason: "provisional", mine: target, max: row.maxPrice, target
         });
-        this.log(`[SEND] SUBMIT SUCCESS NFT #${row.tokenId} ${target} WETH (lượt đã bị thay, vẫn ghi own)`);
+        this.scheduleOwnConfirmation(key, row, postedHashOld, first.correlationId || traceId);
+        this.log(`[SEND] SUBMIT PROVISIONAL NFT #${row.tokenId} ${target} WETH (lượt đã bị thay, vẫn ghi own, chờ xác nhận)`);
         return;
       }
       M("committed");
@@ -3069,25 +3166,48 @@ class OfferItemEngineV2 {
       row.serverLowBal = null;
       row.failures = 0;
       row.retryAt = 0;
-      this.log(`[SEND] SUBMIT SUCCESS NFT #${row.tokenId} ${target} WETH ` +
-        `orderHash=${posted.orderHash || "(phản hồi không kèm hash)"}`);
-      // Order OpenSea vừa nhận là offer của mình — vào sổ ngay, không đợi
-      // Stream vọng lại (xem recordOwnOrder). Hạn = endTime ĐÃ KÝ. Hash: của
-      // phản hồi, hoặc hash Seaport của chính order đã ký khi phản hồi không
-      // kèm - để một SELF REMOVE về sau khớp đúng order này (1.25.10).
-      this.recordOwnOrder(bookNow, posted.orderHash || signed.orderHash, target, durationMinutes,
+      const postedHash = posted.orderHash || signed.orderHash;
+      this.log(`[SEND] SUBMIT PROVISIONAL NFT #${row.tokenId} ${target} WETH ` +
+        `orderHash=${postedHash || "(phản hồi không kèm hash)"} (chờ xác nhận độc lập trước khi tính SUCCESS)`);
+      /**
+       * 2xx = PROVISIONAL, KHÔNG PHẢI SUCCESS (1.25.42 audit)
+       *
+       *   Đo thật 2026-10: tài khoản có 500 order "status":"ACTIVE" cộng
+       *   17.999 WETH trên ví 0.1602 WETH (trong hạn mức đòn bẩy 1000x chính
+       *   thức OpenSea công bố — không phải lỗi số dư), và nhiều NFT riêng lẻ
+       *   có 5-8 own order "ACTIVE" chồng nhau cùng lúc vì order cũ chưa từng
+       *   bị huỷ khi order mới được gửi. "ACTIVE" từ OpenSea chứng minh order
+       *   ký đúng dạng và được NHẬN — không chứng minh nó được OpenSea TÍNH
+       *   vào Best (đúng như "Unfunded!" trên Profile dù 2xx + Activity có
+       *   lệnh + ví đủ WETH cho riêng target đó). Order OpenSea vừa nhận vẫn
+       *   vào sổ NGAY (bảo vệ chống tự-outbid/gửi trùng tức thời — xem
+       *   `recordOwnOrder`/`ownBest`, không đổi), nhưng `confirmed:false` cho
+       *   tới khi một nguồn ĐỘC LẬP với chính POST này xác nhận — Stream echo
+       *   (TokenBook.apply(), tức thời, miễn phí) hoặc một lượt đọc xác nhận
+       *   CÓ GIỚI HẠN sau POST (`scheduleOwnConfirmation`, P2/P3, không chặn
+       *   P0, đúng NFT, không polling toàn cục).
+       */
+      this.recordOwnOrder(bookNow, postedHash, target, durationMinutes,
         Number(signed.components && signed.components.endTime) || 0, first.correlationId || traceId);
       this.bootstrapMark(key, "successAt", Date.now(), "SUCCESS");
       productionTrace.record("submit_success", { correlationId: first.correlationId || traceId }, {
         chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
-        status: "SUCCESS", best: bestNow, mine: target, max: row.maxPrice, target
+        status: "PROVISIONAL", reason: "provisional", best: bestNow, mine: target, max: row.maxPrice, target
       });
+      this.scheduleOwnConfirmation(key, row, postedHash, first.correlationId || traceId);
       /**
        * POST 2xx LÀ TERMINAL CHO Ý ĐỊNH NÀY (port 1.19.61)
        *
        *   Own đã vào sổ đồng bộ ở trên, nên DONE chỉ còn là một nhãn "đang xác
        *   nhận" giả chờ một nhịp dọn. IDLE ngay; khoá single-flight vẫn giữ
        *   tới finally. UI đọc từ sổ cục bộ ngay lượt đẩy kế tiếp.
+       *
+       *   Intent/Flight lifecycle KHÔNG đổi: IDLE đúng ngay cả khi order còn
+       *   provisional — "không còn gì để gửi cho quyết định NÀY" là đúng bất
+       *   kể order có được xác nhận hay không. Nếu xác nhận thất bại, một
+       *   evaluate() sau (do Stream, do watchdog, hay do chính
+       *   scheduleOwnConfirmation khi hết hạn chờ) sẽ tạo Intent MỚI nếu
+       *   NFT vẫn cần gửi — không cần giữ Intent cũ chờ ở đây.
        */
       //
       // A DECISION TAKEN WHILE THIS POST FLEW SURVIVES IT (1.25.12)
@@ -3526,6 +3646,23 @@ class OfferItemEngineV2 {
    */
   abandonFlight(key, why = "abandon") {
     const f = this.flights.get(key);
+    /**
+     * FLIGHT ĐANG GỬI (stage "sending") LÀ MỘT TRƯỜNG HỢP RIÊNG (1.25.44)
+     *
+     *   `f.stage` chỉ đạt "sending" NGAY TRƯỚC khi gọi `this.http.request`
+     *   (xem submitOne) và không đổi cho tới khi lượt đó settle. Nếu
+     *   watchdog bỏ lượt ở đây trong khi stage vẫn "sending", request CÓ
+     *   THỂ đã tới OpenSea -- bỏ qua mà đánh giá/pump lại NGAY (code cũ) mở
+     *   đường cho một POST MỚI đi trước khi lượt cũ tự đối soát (hoặc nếu
+     *   promise gốc không bao giờ settle -- lỗi Node/socket hiếm -- thì
+     *   KHÔNG BAO GIỜ đối soát), sản xuất chính xác hai thứ production đã đo
+     *   được: `http_start` không có terminal, và retry cách nhau ~1s cho
+     *   cùng NFT trong khi lượt trước còn mơ hồ. Coi NGAY LÚC NÀY như một
+     *   HTTP ambiguous thật -- cùng đường với nhánh catch trực tiếp trong
+     *   submitOne (ownUnknownAt, đọc đối soát đúng token, scheduleRetry) --
+     *   thay vì chờ một promise có thể không bao giờ về.
+     */
+    const wasSending = f && f.stage === "sending";
     if (f && f.handle && typeof f.handle.cancel === "function") {
       try { f.handle.cancel(why); } catch { /* đã trả lời */ }
     }
@@ -3539,10 +3676,26 @@ class OfferItemEngineV2 {
       this.setIntent(key, INTENT.READY, { lastError: `${why}: xếp lại` });
     }
     const row = this.rows.get(key);
-    if (row && row.running && this.epoch && this.state === STATE.RUNNING) {
-      this.evaluate(key, Date.now(), null);
-      setImmediate(() => this.pump());
+    if (!row || !row.running || !this.epoch || this.state !== STATE.RUNNING) return;
+    if (wasSending) {
+      const book = this.book.get(key);
+      if (book) book.ownUnknownAt = Date.now();
+      this.netStat("ambiguous", 1);
+      this.stats.abandonedSending = (this.stats.abandonedSending || 0) + 1;
+      this.log(`[WATCHDOG] #${row.tokenId} bỏ lượt ĐANG GỬI (${why}) — kết quả POST chưa xác định, đối soát trước khi gửi lại`);
+      productionTrace.record("submit_ambiguous", { correlationId: it?.traceId || "" }, {
+        chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+        status: "AMBIGUOUS_OUTCOME", reason: why, target: it?.target || 0
+      });
+      // Same UI-truth fix as the direct HTTP-catch ambiguous path (1.25.45):
+      // WAITING + dependency "post-reconcile" NOW, not RETRY for a whole
+      // backoff window first. `it` is still the live intent this abandon
+      // just requeued to READY above.
+      this.deferForOwnSync(key, row, it?.traceId || "", "post-uncertain");
+      return;
     }
+    this.evaluate(key, Date.now(), null);
+    setImmediate(() => this.pump());
   }
 
   /**
@@ -5036,8 +5189,12 @@ class OfferItemEngineV2 {
     const existing = book.own.get(orderHash);
     const realEnd = Number(endTime) || 0;
     if (existing) {
-      if (realEnd > 0 && (!existing.endTime || existing.assumedEnd)) {
-        existing.endTime = realEnd; existing.assumedEnd = false; book.generation++;
+      if (!existing.confirmed || (realEnd > 0 && (!existing.endTime || existing.assumedEnd))) {
+        if (realEnd > 0 && (!existing.endTime || existing.assumedEnd)) { existing.endTime = realEnd; existing.assumedEnd = false; }
+        // A wallet-wide REST resync finding this hash is independent
+        // corroboration, same as a Stream echo (see TokenBook.apply()).
+        existing.confirmed = true;
+        book.generation++;
         return true;
       }
       return false;
@@ -5047,6 +5204,9 @@ class OfferItemEngineV2 {
       orderHash, price: Number(price), maker: book.selfAddress, kind,
       quantity: 1, currency: "WETH",
       endTime: ownEnd, assumedEnd: realEnd <= 0,
+      // Learned from a REST read, not our own in-flight POST -- external
+      // corroboration from the start.
+      confirmed: true,
       seq: 0, at: now
     });
     book.generation++;
@@ -5289,6 +5449,19 @@ class OfferItemEngineV2 {
       // Hạn = endTime ĐÃ KÝ (exact); hẹn giờ hết hạn đánh thức đúng lúc đó.
       endTime,
       assumedEnd: false,
+      /**
+       * PROVISIONAL CHO TỚI KHI CÓ BẰNG CHỨNG ĐỘC LẬP (1.25.42)
+       *
+       *   POST 2xx chỉ chứng minh OpenSea đã NHẬN order ký đúng dạng — đo
+       *   thật: 500 order "status":"ACTIVE" cộng 17.999 WETH trên ví 0.1602
+       *   WETH (trong hạn mức đòn bẩy 1000x chính thức, không phải lỗi dư),
+       *   và nhiều NFT có 5-8 own order ACTIVE chồng nhau vì order cũ không
+       *   bị huỷ khi gửi order mới — "ACTIVE" không chứng minh order được
+       *   OpenSea TÍNH vào Best. `confirmed` chỉ bật khi một nguồn ĐỘC LẬP với
+       *   chính POST này (Stream echo, hoặc đọc xác nhận có giới hạn sau POST)
+       *   nói lại đúng hash — xem TokenBook.apply() và scheduleOwnConfirmation.
+       */
+      confirmed: false,
       seq: 0, at: now
     });
     book.generation++;
@@ -5298,6 +5471,167 @@ class OfferItemEngineV2 {
       chain: this.chain, collection: book.collectionSlug, tokenId: book.tokenId,
       status: "applied", mine: book.ownBest(now).price
     });
+  }
+
+  /**
+   * Xác nhận có giới hạn, theo đúng NFT, cho một own order vừa POST (1.25.42).
+   *
+   *   Chỉ chạy khi Stream CHƯA tự xác nhận trong lúc chờ (xem TokenBook.apply()
+   *   -- miễn phí, tức thời, và là đường xác nhận ưu tiên). Đây là lưới an
+   *   toàn: một lượt đọc P2/P3 scoped đúng token này qua `adapter.fetchBest`,
+   *   kiểm tra hash của ta có thật sự xuất hiện trong danh sách offer OpenSea
+   *   trả về cho token đó hay không -- bằng chứng mạnh hơn trường "status"
+   *   (đã đo: status luôn "ACTIVE" bất kể có bị tính vào Best hay không).
+   *
+   *   BOUNDED: tối đa 2 lượt đọc (6s, rồi 14s nếu lượt đầu chưa thấy), không
+   *   vòng lặp vô hạn, không global polling, không chặn P0 Stream→POST --
+   *   chạy qua RecoveryPlane ở priority nền, y hệt mọi recovery read khác.
+   *   KHÔNG cancel, KHÔNG gửi lại, KHÔNG đổi target -- chỉ xác nhận hoặc ghi
+   *   nhận "chưa xác nhận được" rồi để chu kỳ evaluate() bình thường (Stream,
+   *   watchdog, lần đánh giá kế tiếp) quyết định NFT có cần gửi tiếp hay
+   *   không, dựa trên effectiveBest() thật -- vốn đã luôn bỏ qua own order
+   *   (confirmed hay chưa) nên competitor không bao giờ bị che bởi bước này.
+   */
+  scheduleOwnConfirmation(key, row, orderHash, correlationId = "") {
+    if (!orderHash || typeof this.adapter.fetchBest !== "function") return;
+    // A reprice/renewal for the SAME NFT (new recordOwnOrder, new hash)
+    // supersedes any confirmation check still pending for an older hash of
+    // this key -- that older check no longer matters once a newer order
+    // replaces it. Same registry discipline as ownWaitTimers/firstReadTimers.
+    const stale = this.ownConfirmTimers.get(key);
+    if (stale) { clearTimeout(stale); this.ownConfirmTimers.delete(key); }
+    const generation = this.recovery.generation;
+    const stillPending = () => {
+      if (this.state !== STATE.RUNNING || generation !== this.recovery.generation) return false;
+      const book = this.book.get(key);
+      const entry = book && book.own.get(orderHash);
+      return Boolean(entry && entry.confirmed === false);
+    };
+    const attempt = (delayMs, isLast) => {
+      const timer = setTimeout(() => {
+        this.ownConfirmTimers.delete(key);
+        if (!stillPending()) return;
+        this.recovery.push({
+          kind: "own-confirm", priority: 3,
+          run: async ({ signal }) => {
+            try {
+              const result = await this.adapter.fetchBest(row, { signal, priority: PRIORITY.P2 });
+              /**
+               * "CÓ TRONG DANH SÁCH" ≠ "LÀ BEST" (1.25.42, chữ lại 1.25.45
+               * sau khi đối chiếu docs.opensea.io và đọc lại chain-adapters.js)
+               *
+               *   Bản đầu coi hash của ta XUẤT HIỆN Ở ĐÂU ĐÓ trong `orders`
+               *   là đủ để `confirmed = true`. Không đủ: `orders` là MỌI order
+               *   OpenSea trả cho token này, kể cả của người khác và kể cả
+               *   order "ACTIVE" nhưng Unfunded (đo thật: 500/500 order riêng
+               *   của ví này đều "status":"ACTIVE").
+               *
+               *   `result.orderHash` ở đây KHÔNG phải trường trả về từ chính
+               *   endpoint `GET …/nfts/{id}/best` của OpenSea (bản 1.25.42 ghi
+               *   nhầm là vậy) -- `adapter.fetchBest()` (chain-adapters.js,
+               *   gọi `opensea.js fetchBestOffer()`) cố ý đọc TOÀN BỘ danh
+               *   sách offer còn hiệu lực, MỚI (không cache, phân trang hết)
+               *   của đúng token này, rồi TỰ TÍNH giá cao nhất phía client --
+               *   vì `/best` thật đo được trễ tới ~30s so với Stream/danh
+               *   sách (xem opensea.js, "/best lagged ~30s live"). Bằng
+               *   chứng thật ở đây là: hash của ta có phải đúng cái GIÁ CAO
+               *   NHẤT trong một lượt đọc TOÀN BỘ, MỚI không -- mạnh hơn hẳn
+               *   "có mặt ở đâu đó trong danh sách" (loại cả việc bị một order
+               *   khác vượt giá mà ta chưa thấy), nhưng VẪN KHÔNG phải xác
+               *   nhận trực tiếp từ thuật toán Best-resolution nội bộ của
+               *   OpenSea, và càng không phải bằng chứng funded.
+               *
+               *   GIỚI HẠN THẬT: public API không công bố trường "funded" hay
+               *   "unfunded" ở bất kỳ đâu (đã tra cứu tài liệu chính thức,
+               *   docs.opensea.io -- status chỉ có ACTIVE/INACTIVE/FULFILLED/
+               *   EXPIRED/CANCELLED, không có nghĩa "funded"). Đây là bằng
+               *   chứng mạnh NHẤT không cần thêm request mà ta có thể tính
+               *   được, không phải bằng chứng tuyệt đối — log/trace phải nói
+               *   đúng giới hạn này, không tuyên bố "đã xác minh funded" hay
+               *   "OpenSea tự giải".
+               */
+              const isBest = String(result?.orderHash || "").toLowerCase() === orderHash.toLowerCase();
+              const isListed = !isBest && (result?.orders || []).some(o =>
+                String(o.orderHash || "").toLowerCase() === orderHash.toLowerCase());
+              return { isBest, isListed, generation };
+            } catch (error) {
+              return { isBest: false, isListed: false, error: String(error?.message || error), generation };
+            }
+          },
+          onResult: result => {
+            if (!result || result.generation !== this.recovery.generation) return;
+            if (!stillPending()) return;
+            const book = this.book.get(key);
+            const entry = book.own.get(orderHash);
+            if (result.isBest) {
+              entry.confirmed = true;
+              book.generation++;
+              row.ownConfirmFailStreak = 0;
+              this.log(`[OWN] XÁC NHẬN NFT #${row.tokenId} order ${orderHash.slice(0, 10)}… là giá cao nhất trong lượt đọc toàn bộ danh sách offer, mới ` +
+                `(bằng chứng công khai mạnh nhất không cần thêm request -- API không công bố trường funded/unfunded riêng, không phải xác nhận trực tiếp từ /best của OpenSea)`);
+              productionTrace.record("submit_success", { correlationId }, {
+                chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+                status: "SUCCESS", reason: "confirmed", mine: entry.price, max: row.maxPrice
+              });
+              this.changed();
+              // Resolve the WAITING-on-confirmation state immediately (see
+              // evaluate()'s confirmedOnly check) rather than leaving the row
+              // looking unsettled until some other event happens to fire.
+              if (row.running && this.state === STATE.RUNNING) { this.evaluate(key, Date.now(), null); this.pump(); }
+            } else if (isLast) {
+              this.stats.ownConfirmFailed = (this.stats.ownConfirmFailed || 0) + 1;
+              // Terminal, not just "still provisional": no further confirm
+              // attempt will ever run for this hash (the bounded 6s/14s
+              // budget is spent). ownBest() now excludes "failed" from
+              // `mine` UNCONDITIONALLY (see memory-book.js), so the
+              // evaluate() call below gets a real next decision instead of
+              // recomputing the same ON_TOP-vs-confirmedOnly disagreement
+              // forever with no live timer left to ever resolve it
+              // (orphaned WAITING -- 1.25.43 deadlock fix).
+              entry.confirmed = "failed";
+              book.generation++;
+              /**
+               * CHU KỲ provisional -> fail -> SEND -> provisional... (1.25.44)
+               *
+               *   Mỗi chu kỳ TỰ NÓ bounded (6s/14s, rồi loại khỏi mine) --
+               *   nhưng không gì chặn CHUỖI chu kỳ đó lặp vô hạn nếu own
+               *   order cứ liên tục không được giải làm Best (ví dụ thật:
+               *   Unfunded dai dẳng). `ownConfirmFailStreak` (KHÔNG phải
+               *   `row.failures`, bị POST 2xx reset mỗi chu kỳ) leo backoff
+               *   riêng cho đúng trường hợp này, dùng lại CHÍNH CƠ CHẾ
+               *   `row.retryAt`/`notBefore` đã có cho mọi loại retry khác --
+               *   không spam lại NGAY cùng target, nhưng một competitor/
+               *   target thật mới vẫn được evaluate() tính ra một intent
+               *   (chỉ bị notBefore trì hoãn như mọi retry khác, không bị
+               *   chặn cứng).
+               */
+              row.ownConfirmFailStreak = (row.ownConfirmFailStreak || 0) + 1;
+              const policy = RETRY_POLICY["own-confirm-failed"];
+              const backoff = Math.min(policy.max, policy.base * Math.pow(2, Math.min(6, row.ownConfirmFailStreak - 1)));
+              row.retryAt = Date.now() + backoff;
+              this.log(`[OWN] KHÔNG xác nhận được NFT #${row.tokenId} order ${orderHash.slice(0, 10)}… là giá cao nhất sau xác nhận có giới hạn` +
+                (result.isListed ? " (order CÓ trong danh sách offers nhưng KHÔNG phải giá cao nhất -- có thể Unfunded hoặc bị vượt giá)" : " (order không thấy trong danh sách offers)") +
+                ` — không còn tính vào mine, competitor giữ nguyên effectiveBest, chu kỳ #${row.ownConfirmFailStreak} lùi ${backoff}ms`);
+              productionTrace.record("submit_failure", { correlationId }, {
+                chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+                status: "FAILED", reason: "unconfirmed"
+              });
+              // Normal progress must not depend on watchdog: re-evaluate now
+              // so this row gets a fresh real decision immediately (subject
+              // to the backoff just set above via row.retryAt), not whenever
+              // some unrelated future event happens to fire.
+              if (row.running && this.state === STATE.RUNNING) { this.evaluate(key, Date.now(), null); this.pump(); }
+            } else {
+              attempt(14000, true);
+            }
+          },
+          onDrop: () => { if (!isLast) attempt(14000, true); }
+        });
+      }, delayMs);
+      timer.unref?.();
+      this.ownConfirmTimers.set(key, timer);
+    };
+    attempt(6000, false);
   }
 
   /** Tín hiệu "có gì đó đổi" cho giao diện. Rẻ; người nhận tự gộp. */

@@ -30,6 +30,8 @@ const suites = [
   { file: "own-authority-startup-test.js" },
   { file: "stream-dual-feed-test.js" },
   { file: "stream-dual-feed-wiring-test.js" },
+  { file: "provisional-own-order-test.js" },
+  { file: "ambiguous-post-outcome-test.js" },
   { file: "offer-item-v2-stress-test.js" },
   { file: "shared-credentials-bridge-test.js" },
   { file: "shared-credentials-hooks-test.js" },
