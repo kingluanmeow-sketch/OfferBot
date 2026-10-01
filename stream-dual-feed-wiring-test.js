@@ -51,15 +51,21 @@ function bid(slug, n = 1) {
 }
 
 /** Minimal, directly controllable stand-in for rate-limiter.js's ApiKeyManager. */
+// fp is derived from the key VALUE (not just its slot position), the same
+// way the real rate-limiter.js keyFingerprint() works -- changing which
+// literal key sits in a slot must change its fingerprint, or refreshKey()'s
+// own short-circuit (`nextSignature === this.lastKeySignature` ->
+// no-op, see stream-sdk.js) would never detect a real key swap in a slot.
+const deriveFp = key => `fp-${String(key).slice(-6)}`;
 function fakeApiKeys(keys) {
-  const pool = keys.map((key, i) => ({ key, fp: `fp${i + 1}`, slot: i + 1, role: `key${i + 1}` }));
+  const pool = keys.map((key, i) => ({ key, fp: deriveFp(key), slot: i + 1, role: `key${i + 1}` }));
   return {
     pool,
     primary: () => pool[0] || null,
     secondary: () => pool[1] || null,
     find: key => pool.find(e => e.key === key) || null,
     fingerprint: () => pool.map(e => e.key).sort().join(" "),
-    setKeys(newKeys) { pool.length = 0; pool.push(...newKeys.map((key, i) => ({ key, fp: `fp${i + 1}`, slot: i + 1, role: `key${i + 1}` }))); }
+    setKeys(newKeys) { pool.length = 0; pool.push(...newKeys.map((key, i) => ({ key, fp: deriveFp(key), slot: i + 1, role: `key${i + 1}` }))); }
   };
 }
 
@@ -168,21 +174,50 @@ const SLUGS_123 = Array.from({ length: 123 }, (_, i) => `c${String(i).padStart(3
   feed.stop();
 }
 
-// ---- Case 5: second key CHANGED live -> old B client gone, new one on new key
+// ---- Case 5: second key CHANGED live -> old B client closed, new B client
+// on the new key's fingerprint, feed A completely untouched. -------------
 {
   const apiKeys = fakeApiKeys(["key-1", "key-2-old"]);
   const { feed } = newFeed(apiKeys);
   feed.start(["alpha"]);
-  const oldBClient = feed.feedB.shards[0].stream.client;
-  assert.equal(oldBClient.config.apiKey, "key-2-old");
+
+  const oldBShards = feed.feedB.shards;
+  const oldBClients = oldBShards.map(s => s.stream.client);
+  const oldBSignature = oldBShards[0].stream.lastKeySignature;
+  assert.equal(oldBSignature, `b:${deriveFp("key-2-old")}`);
+
+  const feedAShardsBefore = feed.feedA.shards;
+  const feedAClientsBefore = feedAShardsBefore.map(s => s.stream.client);
+  const feedASignatureBefore = feedAShardsBefore[0].stream.lastKeySignature;
 
   // refreshKey() is what main.js calls on every settings save; it must
   // re-point feed B's underlying socket to a changed key, not silently keep
-  // using the old one.
+  // using the old one -- and must not touch feed A's socket/key at all.
   apiKeys.setKeys(["key-1", "key-2-changed"]);
   feed.refreshKey();
-  check("refreshKey() after a changed second key re-points feed B's client to the new key", () => {
-    assert.ok(feed.feedB, "feed B should still exist");
+
+  check("the OLD feed B client(s) are disconnected after a key change", () => {
+    for (const client of oldBClients) assert.equal(client.disconnected, true, "an old feed B client was never disconnected -- stale socket");
+  });
+  check("every feed B shard now carries the NEW key's fingerprint signature, not the old one", () => {
+    const expected = `b:${deriveFp("key-2-changed")}`;
+    for (const shard of feed.feedB.shards) {
+      assert.equal(shard.stream.lastKeySignature, expected);
+      assert.notEqual(shard.stream.lastKeySignature, oldBSignature);
+    }
+  });
+  check("feed B's new client(s) are NOT the same object as the old ones", () => {
+    const newClients = feed.feedB.shards.map(s => s.stream.client);
+    for (const c of newClients) assert.ok(!oldBClients.includes(c), "feed B reused an old (already-disconnected) client instead of a fresh one");
+  });
+  check("feed A's shard objects, their clients, and their key signature are completely unchanged", () => {
+    assert.equal(feed.feedA.shards.length, feedAShardsBefore.length);
+    feed.feedA.shards.forEach((shard, i) => {
+      assert.equal(shard, feedAShardsBefore[i], "feed A shard object identity changed");
+      assert.equal(shard.stream.client, feedAClientsBefore[i], "feed A client was recreated/disconnected by feed B's key change");
+      assert.equal(shard.stream.client.disconnected, false, "feed A's client was disconnected by feed B's key change");
+    });
+    assert.equal(feed.feedA.shards[0].stream.lastKeySignature, feedASignatureBefore);
   });
   feed.stop();
 }
