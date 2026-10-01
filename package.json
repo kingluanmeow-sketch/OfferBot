@@ -1,13 +1,13 @@
 {
   "name": "opensea-offer-bot",
-  "version": "1.25.33",
+  "version": "1.25.34",
   "description": "OpenSea Offer Bot - Electron / Seaport 1.6 / OpenSea Stream API",
   "author": "OpenSea Offer Bot",
   "license": "UNLICENSED",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder --win",
+    "build": "node tools/build-gate.js && electron-builder --win",
     "check": "node scripts-check.js",
     "smoke": "electron smoke-test.js",
     "license": "node make-license.js",
@@ -24,7 +24,8 @@
     "test:stream-ab": "node stream-sdk-test.js && node stream-ab-architecture-test.js && node offer-item-v2-ab-selfcancel-test.js",
     "test:numeric-trait-offers": "node numeric-trait-offer-test.js",
     "benchmark:stream-ab": "node stream-global-vs-tracked-benchmark.js",
-    "test:all": "node scripts-check.js && node run-all-tests.js",
+    "test:all": "node tools/build-gate.js && node scripts-check.js && node run-all-tests.js",
+    "gate": "node tools/build-gate.js",
     "license:backup": "node backup-license-data.js"
   },
   "dependencies": {
@@ -43,7 +44,7 @@
     "electronVersion": "33.4.11",
     "productName": "OpenSea Offer Bot",
     "directories": {
-      "output": "dist-build-1.25.33-priority-tier-fix",
+      "output": "dist-build-1.25.34-shared-credentials",
       "buildResources": "assets"
     },
     "files": [
@@ -52,6 +53,8 @@
       "preload.js",
       "db.js",
       "secret-store.js",
+      "shared-credentials.js",
+      "shared-credentials-bridge.js",
       "wallet-profiles.js",
       "offer-item-v2/**/*",
       "nft-source.js",

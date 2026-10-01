@@ -4,6 +4,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const suites = [
+  { file: "tools/build-gate.js" },
   { file: "numeric-trait-offer-test.js" },
   { file: "opensea-criteria-test.js" },
   { file: "offer-item-v2-recovery-lifecycle-test.js" },
@@ -26,6 +27,10 @@ const suites = [
   { file: "own-remove-grace-test.js" },
   { file: "priority-inversion-flight-test.js" },
   { file: "offer-item-v2-stress-test.js" },
+  { file: "shared-credentials-bridge-test.js" },
+  { file: "shared-credentials-hooks-test.js" },
+  { file: "shared-credentials-concurrency-test.js" },
+  { file: "wallet-profiles-test.js" },
   { file: "update-test.js", electron: true }
 ];
 let failed = 0;

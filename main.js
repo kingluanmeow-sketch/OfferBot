@@ -100,6 +100,8 @@ const { LicenseClient } = require("./license-client");
 const openseaSession = require("./session");
 const { SecretStore, migrateSecrets, recoverFailedSecrets } = require("./secret-store");
 const { WalletProfiles } = require("./wallet-profiles");
+const { SharedCredentials } = require("./shared-credentials");
+const { SharedBridge } = require("./shared-credentials-bridge");
 const { RemoteHost } = require("./remote-host");
 const { AddBatchGate } = require("./add-batch-gate");
 
@@ -163,6 +165,15 @@ let walletProfiles = null;
  * encryption, same file format - only the location differs.
  */
 let licenceVault = null;
+
+/**
+ * Kho credential MÃ HOÁ dùng chung với tool Bulk Offer Cancel (cùng tài khoản
+ * Windows). Chỉ slot 1 (primary) đồng bộ; Tool khác không bao giờ đọc/ghi kho
+ * này. Lỗi của kho chung không bao giờ làm hỏng OfferBot.
+ */
+let sharedBridge = null;
+/** True while a value taken FROM the shared store is being applied (no echo back). */
+let sharedAdopting = false;
 
 /**
  * Điều phối hạn mức GHI của Offer Item, dùng chung cho cả máy.
@@ -699,6 +710,7 @@ function normalizeApiKeySlots() {
   db.updateSettings(changed);
   if (secrets && secrets.isAvailable()) secrets.save(changed);
   if (credentialDefaults && credentialDefaults.isAvailable()) credentialDefaults.save(changed);
+  sharedPush(changed);
   logger.engine(`[API] sắp lại ô key: Key 1 ${key1 ? "có" : "trống"} · Key 2 ${key2 ? "có" : "trống"}` +
     (dropped ? ` · bỏ ${dropped} key thừa (chỉ giữ hai)` : ""));
   return true;
@@ -1625,6 +1637,101 @@ function adoptSharedLicence() {
   return true;
 }
 
+// ---- kho credential dùng chung (shared-credentials-bridge.js) -------------
+//
+// Ánh xạ THEO VỊ TRÍ key: apiKeys <-> apiKey1, apiKey2 <-> apiKey2,
+// privateKey <-> privateKey, licenseKey <-> licenseKey. Chỉ slot 1 (primary).
+
+/** Một giá trị MỚI HƠN từ kho chung được nhận vào kho riêng + db (đồng bộ). */
+function applySharedField(field, value) {
+  const v = String(value || "").trim();
+  if (field === "privateKey" && v && !walletAddressFromPrivateKey(v)) return false;
+  const result = db.updateSettings({ [field]: v });
+  if (result && result.ok === false) return false;
+  if (secrets && secrets.isAvailable()) secrets.save({ [field]: v });
+  if (field === "licenseKey" && licenceVault && licenceVault.isAvailable()) licenceVault.save({ licenseKey: v });
+  if (field === "privateKey" && walletProfiles) {
+    if (v) walletProfiles.upsertActive(v); else walletProfiles.clearActive();
+  }
+  return true;
+}
+
+/** Đẩy giá trị người dùng vừa lưu lên kho chung. Không bao giờ ném lỗi. */
+function sharedPush(values) {
+  if (!sharedBridge || sharedAdopting) return;
+  try { sharedBridge.push(values); } catch { /* kho chung không được làm hỏng việc lưu */ }
+}
+
+/** Khởi tạo + bootstrap (chỉ primary), trước khi engine/applySettings chạy. */
+function initSharedCredentials() {
+  const self = instance.get();
+  const primary = self.slot === 1 && !self.overflow;
+  if (!primary) return;
+
+  let dir;
+  const override = String(process.env.OFFERBOT_SHARED_CRED_DIR || "").trim();
+  if (override && !app.isPackaged) dir = override;
+  else if (devRuntime.isDev()) {
+    logger.engine("[SHARED] bản dev: không dùng kho credential dùng chung của production");
+    return;
+  }
+
+  // Key positions must be settled BEFORE they are compared with the shared store
+  // (a legacy "k1,k2" in apiKeys must not be published as Key 1). Idempotent.
+  try { normalizeApiKeySlots(); } catch { /* the regular boot call below still runs */ }
+
+  sharedBridge = new SharedBridge({
+    primary: true,
+    shared: () => new SharedCredentials({
+      dir,
+      tool: "offerbot",
+      lockWaitMs: 1500,
+      log: line => logger.engine(line)
+    }),
+    metaFile: path.join(self.primarySettingsBase, "shared-sync-meta.json"),
+    local: {
+      get: field => String(db.getSettings()[field] || ""),
+      apply: (field, value) => {
+        sharedAdopting = true;
+        try { return applySharedField(field, value); } finally { sharedAdopting = false; }
+      }
+    },
+    // Boot: nothing runs yet, everything may be adopted. Later: never swap a key
+    // under a running app, and a licence is only taken when this window has none.
+    canApply: (field, ctx) => {
+      if (ctx && ctx.boot) return true;
+      if (field === "licenseKey") return !String(db.getSettings().licenseKey || "").trim();
+      return describeWorkInFlight().length === 0;
+    },
+    log: line => logger.engine(line)
+  });
+  try { sharedBridge.bootstrap(); } catch { /* never breaks boot */ }
+}
+
+/** The 60 s beat: one stat when nothing changed; adopted values reach the running app here. */
+function sharedPoll() {
+  if (!sharedBridge) return;
+  const walletBefore = configuredWallet();
+  let adopted = [];
+  try { adopted = sharedBridge.poll() || []; } catch { return; }
+  if (!adopted.length) return;
+
+  sharedAdopting = true;
+  try {
+    if (adopted.includes("apiKeys") || adopted.includes("apiKey2")) normalizeApiKeySlots();
+  } finally { sharedAdopting = false; }
+  const applied = applySettings();
+  if (adopted.includes("licenseKey")) publishLicense(true);
+  if (adopted.includes("privateKey")) {
+    const walletAfter = configuredWallet();
+    if (walletBefore !== walletAfter) {
+      Promise.all([...engines.values()].map(engine => engine.rebindWallet(applied)))
+        .then(() => openseaSession.walletChanged(walletAfter))
+        .catch(error => logger.error(`[SESSION] reconnect lỗi: ${error.message}`));
+    }
+  }
+}
+
 function publishLicense(force = false) {
   const status = license.status();
   const signature = `${status.locked}|${status.serverStatus}|${status.lockReason}|${status.name}`;
@@ -1853,6 +1960,7 @@ function registerIpc() {
         licenceVault.save({ licenseKey: payload.key });
       }
       const saved = secrets.save({ licenseKey: payload.key });
+      sharedPush({ licenseKey: payload.key });
       if (!saved.ok) {
         logger.error(
           "[SECRETS] không lưu được License Key — lần mở sau sẽ phải kích hoạt lại."
@@ -1890,6 +1998,7 @@ function registerIpc() {
       if (cleared && cleared.ok === false) return cleared;
       db.updateSettings({ apiKey2: "" });
       if (credentialDefaults && credentialDefaults.isAvailable()) credentialDefaults.save({ apiKey2: "" });
+      sharedPush({ apiKey2: "" });
       applySettings();
       logger.api("Key 2 đã gỡ · chạy một key");
       return { ok: true, slot, cleared: true, keys: keyStatsSnapshot() };
@@ -1927,6 +2036,7 @@ function registerIpc() {
     if (credentialDefaults && credentialDefaults.isAvailable()) {
       credentialDefaults.save({ [field]: key });
     }
+    sharedPush({ [field]: key });
     applySettings();
     logger.api(`Key ${slot} kích hoạt · vân tay ${rateLimiter.keyFingerprint(key)} · pool ${rateLimiter.apiKeys.size()} key`);
 
@@ -2012,6 +2122,17 @@ function registerIpc() {
 
     if (settings && ("apiKeys" in settings || "apiKey" in settings || "apiKey2" in settings)) {
       normalizeApiKeySlots();
+    }
+    // Shared credential store (primary slot only): AFTER the key slots settled,
+    // so the final Key 1 / Key 2 positions are what is published.
+    if (settings && secretResult.ok) {
+      const touched = {};
+      const finalSettings = db.getSettings();
+      if ("apiKeys" in settings || "apiKey" in settings) touched.apiKeys = finalSettings.apiKeys || "";
+      if ("apiKey2" in settings) touched.apiKey2 = finalSettings.apiKey2 || "";
+      if ("privateKey" in settings) touched.privateKey = settings.privateKey;
+      if ("licenseKey" in settings) touched.licenseKey = settings.licenseKey;
+      if (Object.keys(touched).length) sharedPush(touched);
     }
     const applied = applySettings();
     logger.engine("Settings saved.");
@@ -3013,6 +3134,10 @@ function boot() {
       logger.license("licence hiện có được chuyển sang kho dùng chung của máy");
     }
 
+    // Kho credential dùng chung với Bulk Offer Cancel (chỉ slot 1): nhận/đẩy
+    // trước khi engine dựng, để key mới hơn từ tool kia vào đúng lần boot này.
+    try { initSharedCredentials(); } catch (error) { logger.engine(`[SHARED] init=FAILED ${error.message}`); }
+
     // Kho canonical đã đọc xong — dù có tìm thấy key hay không. Từ đây trở đi
     // "không có licence" là một KẾT LUẬN, không còn là "chưa kịp xem".
     license.hydrated(true);
@@ -3142,6 +3267,7 @@ function boot() {
     // should unlock by itself, not on the next restart. Only ever adopts a key
     // when this window has none, so a window is never switched off the key it
     // is already running on.
+    try { sharedPoll(); } catch { /* the beat continues regardless */ }
     try { adoptSharedLicence(); } catch { /* the beat continues regardless */ }
     try { publishLicense(); } catch { /* a status check must never break the tick */ }
   }, LICENSE_RECHECK_MS);
