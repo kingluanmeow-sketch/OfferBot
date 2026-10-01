@@ -116,9 +116,28 @@ class OpenSeaStream {
     /** slug -> timer. Scoped join-ACK timeout, one per topic, independent of
      *  every other topic's — a sibling ACKing does not cancel this one. */
     this.topicJoinTimers = new Map();
-    /** slug -> last matched-event ms. DIAGNOSTICS ONLY (health()/trace) — a
-     *  quiet topic is not evidence of failure (AGENTS.md "market silence is
-     *  not failure"); nothing here ever triggers reconnect/REST on its own. */
+    /** slug -> timer. Backoff delay before a scoped rejoin actually fires
+     *  (point 3): exponential + jitter, capped, reset to attempt 0 on the
+     *  topic's own ACK. Same shape as the existing socket-level retry
+     *  (scheduleClientRetry) for consistency, just scoped to one topic. */
+    this.topicRejoinTimers = new Map();
+    /**
+     * slug -> last matched-event ms. DIAGNOSTICS ONLY (status()/trace).
+     *
+     *   Read it, never act on it. No code path compares "now minus this" to
+     *   a threshold to decide a topic is unhealthy, reconnect, or go to
+     *   REST -- that would be exactly the "market silence is failure"
+     *   mistake AGENTS.md §7 forbids, since a real collection can be quiet
+     *   for a long time with nothing wrong.
+     *
+     *   This does NOT change `checkOrderBlind()`/`lastOrderEventAt`: that
+     *   90s airbag stays SHARD-WIDE, unchanged, by design -- it only fires
+     *   when literally every tracked topic on the shard is silent, which is
+     *   a meaningful aggregate signal in a way a single quiet topic is not.
+     *   Per-topic recovery in this version is driven ENTIRELY by explicit
+     *   evidence (a topic's own refusal or its own join-ACK timeout), never
+     *   by this timestamp.
+     */
     this.lastEventAtBySlug = new Map();
     this.retryAttempt = 0;
     this.eventSequence = 0;
@@ -232,12 +251,17 @@ class OpenSeaStream {
   subscribeTopic(slug, generation = this.clientGeneration) {
     if (!this.client || this.topicUnsubs.has(slug)) return;
     this.topicUnsubs.set(slug, this.client.onEvents(slug, this.eventTypes(), event => this.handleSdkEvent(generation, event)));
-    this.topicState.set(slug, { state: "JOINING", ackedAt: 0 });
+    // Preserve rejoinAttempt across a scoped rejoin -- a fresh subscribe
+    // must NOT reset the backoff counter, or point 3's exponential growth
+    // never actually grows (every retry would look like attempt 0 again).
+    const prevAttempt = this.topicState.get(slug)?.rejoinAttempt || 0;
+    this.topicState.set(slug, { state: "JOINING", ackedAt: 0, rejoinAttempt: prevAttempt });
     this.watchTopicJoinAck(slug, generation);
   }
 
   /** One join-ACK timeout per topic. A sibling topic's ACK never cancels or
-   *  resets this one -- that independence is the whole fix. */
+   *  resets this one -- that independence is the whole fix. Evidence-based
+   *  (no reply within a bounded window), never "topic has been quiet". */
   watchTopicJoinAck(slug, generation) {
     const old = this.topicJoinTimers.get(slug);
     if (old) clearTimeout(old);
@@ -250,10 +274,35 @@ class OpenSeaStream {
       logger.stream(`[STREAM] topic ${safeText(slug, 80)} join ACK timeout${this.label} · scoped rejoin`);
       entry.state = "REFUSED";
       try { this.onTopicUnavailable(slug, Date.now(), "topic-join-ack-timeout"); } catch (error) { this.recordHandlerError(error, "topic ack-timeout hook"); }
-      this.rejoinTopic(slug, generation);
+      this.scheduleTopicRejoin(slug, generation);
     }, TOPIC_JOIN_ACK_MS);
     timer.unref?.();
     this.topicJoinTimers.set(slug, timer);
+  }
+
+  /**
+   * Point 3: bounded exponential backoff + jitter before a scoped rejoin,
+   * same shape as the existing socket-level scheduleClientRetry (1s * 2^n,
+   * capped 30s, 0.8-1.2x jitter) so one topic repeatedly failing to join
+   * cannot retry every 12s forever -- and cannot affect siblings or the
+   * realtime hot path, since nothing here touches the socket or other
+   * topics' state.
+   */
+  scheduleTopicRejoin(slug, generation) {
+    const old = this.topicRejoinTimers.get(slug);
+    if (old) clearTimeout(old);
+    const entry = this.topicState.get(slug) || { rejoinAttempt: 0 };
+    const attempt = entry.rejoinAttempt || 0;
+    const base = Math.min(1000 * (2 ** attempt), 30000);
+    const delay = Math.max(500, Math.round(base * (0.8 + Math.random() * 0.4)));
+    entry.rejoinAttempt = attempt + 1;
+    this.topicState.set(slug, entry);
+    const timer = setTimeout(() => {
+      this.topicRejoinTimers.delete(slug);
+      this.rejoinTopic(slug, generation);
+    }, delay);
+    timer.unref?.();
+    this.topicRejoinTimers.set(slug, timer);
   }
 
   /** Scoped recovery for ONE topic: drop and resubscribe just that topic on
@@ -272,6 +321,9 @@ class OpenSeaStream {
     const timer = this.topicJoinTimers.get(slug);
     if (timer) clearTimeout(timer);
     this.topicJoinTimers.delete(slug);
+    const rejoinTimer = this.topicRejoinTimers.get(slug);
+    if (rejoinTimer) clearTimeout(rejoinTimer);
+    this.topicRejoinTimers.delete(slug);
     this.topicState.delete(slug);
     this.lastEventAtBySlug.delete(slug);
   }
@@ -385,13 +437,16 @@ class OpenSeaStream {
         entry.state = "ACKED";
         entry.ackedAt = Date.now();
         entry.joinedOnce = true;
+        entry.rejoinAttempt = 0; // backoff resets on a real ACK (point 3)
         this.topicState.set(slug, entry);
-        if (!this.subscriptionActive) this.onGlobalSubscriptionReady();
-        // Socket-level readiness already fired onTopicJoined for every
-        // tracked slug via onGlobalSubscriptionReady; this covers the case
-        // this specific topic is joining/rejoining AFTER that already ran
-        // (late ACK, scoped rejoin) so its own gate still opens.
-        else if (!wasJoined) {
+        const wasShardActive = this.subscriptionActive;
+        if (!wasShardActive) this.onGlobalSubscriptionReady();
+        // ONLY the slug that just ACKed is "joined" -- never every tracked
+        // collection (that bulk-fire was the bug this version fixes). Fires
+        // exactly once per topic: the first time THIS slug's own ACK lands,
+        // whether that is the shard's bootstrap topic, a late straggler, or
+        // a scoped rejoin after a timeout/refusal.
+        if (!wasJoined) {
           try { this.onTopicJoined(slug, entry.ackedAt); } catch (error) { this.recordHandlerError(error, "topic joined hook"); }
         }
       } else {
@@ -403,6 +458,9 @@ class OpenSeaStream {
         this.lastError = safeText(JSON.stringify(frame[4] && frame[4].response || { status }));
         logger.stream(`[STREAM] topic ${safeText(slug, 80)} refused${this.label} status=${safeText(status, 32)} detail=${this.lastError}`);
         try { this.onTopicUnavailable(slug, Date.now(), "topic-join-refused"); } catch (error) { this.recordHandlerError(error, "topic refused hook"); }
+        // Scoped rejoin with backoff (point 2/3) -- do not wait for a full
+        // socket reconnect to retry one refused topic.
+        this.scheduleTopicRejoin(slug, generation);
       }
       return;
     }
@@ -454,7 +512,14 @@ class OpenSeaStream {
           catch (error) { this.recordHandlerError(error, "gap reconciliation hook"); }
         }
       });
-    } else if (!wasEverActive) {
+    } else if (!wasEverActive && !this.perCollection) {
+      // GLOBAL mode only: one `collection:*` subscription genuinely covers
+      // every tracked slug, so this one ACK really is "every topic joined".
+      // In perCollection mode each slug has its OWN join reply -- bulk-firing
+      // here for every tracked slug was exactly the bug this version fixes:
+      // only the FIRST topic has actually ACKed at this point. perCollection
+      // topics get onTopicJoined individually, from their own phx_reply, in
+      // onSocketMessage.
       const joinedAt = Date.now();
       setImmediate(() => {
         for (const slug of this.collections) {
@@ -660,6 +725,8 @@ class OpenSeaStream {
     // report a topic healthy before its real rejoin reply has arrived.
     for (const timer of this.topicJoinTimers.values()) clearTimeout(timer);
     this.topicJoinTimers.clear();
+    for (const timer of this.topicRejoinTimers.values()) clearTimeout(timer);
+    this.topicRejoinTimers.clear();
     this.topicState.clear();
     if (unsubscribe) { try { unsubscribe(); } catch {} }
     if (client) { try { client.disconnect(() => {}); } catch {} }

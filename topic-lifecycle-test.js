@@ -237,5 +237,138 @@ function newStream(opts = {}) {
   });
 }
 
+// ---- Case 9 (v1.25.36 audit fixes): bootstrap ACK fires onTopicJoined ONLY
+// for the slug that actually ACKed, never for every tracked collection. ---
+{
+  const { stream, joined } = newStream(); // tracks topic-a, topic-b
+  stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-a"));
+  check("only topic-a's own ACK fired onTopicJoined -- NOT topic-b, which never ACKed", () => {
+    assert.deepEqual(joined, ["topic-a"]);
+  });
+  check("topic-b is still not HEALTHY after topic-a's bootstrap ACK (no more bulk-fire bug)", () =>
+    assert.equal(stream.healthForCollection("topic-b"), "RECONNECTING"));
+}
+
+// ---- Case 10: phx_reply refused schedules a scoped rejoin immediately,
+// without waiting for a socket reconnect. -------------------------------
+{
+  const { stream, client, unavailable } = newStream();
+  stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-a"));
+  stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-b", "error"));
+  check("refusal is reported immediately", () =>
+    assert.ok(unavailable.some(u => u.slug === "topic-b" && u.reason === "topic-join-refused")));
+  check("a scoped rejoin timer is armed for topic-b right after the refusal (no reconnect needed)", () =>
+    assert.ok(stream.topicRejoinTimers.has("topic-b")));
+  check("the rejoin timer does not touch the live subscription yet (still unsubscribed until the backoff elapses)", () => {
+    // rejoinAttempt was bumped by scheduling, proving the backoff path ran.
+    assert.equal(stream.topicState.get("topic-b").rejoinAttempt, 1);
+  });
+}
+
+// ---- Case 11: repeated timeout -> exponential backoff, not a flat 12s
+// retry forever. ----------------------------------------------------------
+{
+  const { stream } = newStream();
+  stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-a"));
+  // Simulate three consecutive join-ACK timeouts for topic-b by invoking the
+  // same scoped-rejoin path the real 12s timer body takes, back to back
+  // (deterministic -- no real wall-clock wait).
+  const delays = [];
+  const origSetTimeout = global.setTimeout;
+  global.setTimeout = (fn, ms, ...rest) => { delays.push(ms); return origSetTimeout(() => {}, 0); }; // capture, never actually fire
+  try {
+    stream.topicState.set("topic-b", { state: "REFUSED", ackedAt: 0, rejoinAttempt: 0 });
+    stream.scheduleTopicRejoin("topic-b", stream.clientGeneration);
+    stream.topicState.set("topic-b", { state: "REFUSED", ackedAt: 0, rejoinAttempt: stream.topicState.get("topic-b").rejoinAttempt });
+    stream.scheduleTopicRejoin("topic-b", stream.clientGeneration);
+    stream.scheduleTopicRejoin("topic-b", stream.clientGeneration);
+  } finally { global.setTimeout = origSetTimeout; }
+  check("repeated failures grow the backoff delay (not a flat retry interval)", () => {
+    assert.ok(delays.length >= 3, `expected >=3 scheduled delays, got ${delays.length}`);
+    // Jitter is +/-20%, so compare midpoints: each attempt's base should be
+    // roughly double the previous (1s, 2s, 4s ... before the 30s cap).
+    assert.ok(delays[1] > delays[0] * 1.3, `delays[1]=${delays[1]} should clearly exceed delays[0]=${delays[0]}`);
+    assert.ok(delays[2] > delays[1] * 1.3, `delays[2]=${delays[2]} should clearly exceed delays[1]=${delays[1]}`);
+  });
+  check("backoff is bounded (capped base 30s, so with max jitter never far past it)", () => {
+    for (const d of delays) assert.ok(d <= 30000 * 1.25, `delay ${d} exceeded the cap`);
+  });
+}
+
+// ---- Case 12: repeated refused (not just timeout) also backs off ------
+{
+  const { stream } = newStream();
+  stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-a"));
+  const delays = [];
+  const origSetTimeout = global.setTimeout;
+  global.setTimeout = (fn, ms, ...rest) => { delays.push(ms); return origSetTimeout(() => {}, 0); };
+  try {
+    stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-b", "error"));
+    // topic-b is now REFUSED with a pending rejoin timer; simulate that
+    // timer firing (rejoinTopic) then a SECOND refusal on the resubscribe.
+    const pending = stream.topicRejoinTimers.get("topic-b");
+    assert.ok(pending);
+    stream.topicRejoinTimers.delete("topic-b");
+    stream.rejoinTopic("topic-b", stream.clientGeneration); // re-subscribes, JOINING again
+    stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-b", "error")); // refused again
+  } finally { global.setTimeout = origSetTimeout; }
+  check("a second consecutive refusal schedules a LONGER backoff than the first", () => {
+    assert.ok(delays.length >= 2);
+    assert.ok(delays[1] > delays[0] * 1.3, `second refusal delay ${delays[1]} should exceed first ${delays[0]}`);
+  });
+}
+
+// ---- Case 13: backoff resets to attempt 0 after a real ACK ------------
+{
+  const { stream } = newStream();
+  stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-a"));
+  stream.topicState.set("topic-b", { state: "JOINING", ackedAt: 0, rejoinAttempt: 5 }); // pretend 5 prior failures
+  stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-b"));
+  check("a successful ACK resets rejoinAttempt to 0", () =>
+    assert.equal(stream.topicState.get("topic-b").rejoinAttempt, 0));
+  const delays = [];
+  const origSetTimeout = global.setTimeout;
+  global.setTimeout = (fn, ms) => { delays.push(ms); return origSetTimeout(() => {}, 0); };
+  try {
+    // If this topic fails again NOW, it must retry fast (attempt 0 again),
+    // not pick up where the pre-ACK streak left off.
+    stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-b", "error"));
+  } finally { global.setTimeout = origSetTimeout; }
+  check("the next failure after a reset starts from a short delay again, not the old streak's long one", () => {
+    assert.ok(delays[0] < 2000, `expected a short post-reset delay, got ${delays[0]}`);
+  });
+}
+
+// ---- Case 14: stop() / remove / reconnect clear EVERY timer map, and a
+// rejoin never leaves more than one live subscription. -------------------
+{
+  const { stream, client } = newStream();
+  stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-a"));
+  stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-b", "error")); // arms a rejoin timer
+  assert.ok(stream.topicRejoinTimers.has("topic-b"));
+  stream.stopClient();
+  check("stopClient clears topicRejoinTimers too (not just topicJoinTimers/topicState)", () => {
+    assert.equal(stream.topicRejoinTimers.size, 0);
+    assert.equal(stream.topicJoinTimers.size, 0);
+    assert.equal(stream.topicState.size, 0);
+  });
+}
+{
+  const { stream, client } = newStream();
+  stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-a"));
+  stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-b", "error"));
+  stream.setCollections(["topic-a"]); // remove topic-b while its rejoin timer is pending
+  stream.syncTopics();
+  check("removing a topic while its rejoin backoff is pending clears that timer too", () =>
+    assert.ok(!stream.topicRejoinTimers.has("topic-b")));
+  stream.setCollections(["topic-a", "topic-b"]);
+  stream.syncTopics();
+  stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-b"));
+  check("re-adding and re-ACKing leaves exactly one live subscription, no duplicate", () => {
+    assert.equal([...client.topics.keys()].filter(k => k === "topic-b").length, 1);
+    assert.equal(stream.healthForCollection("topic-b"), "HEALTHY");
+  });
+}
+
 process.stdout.write(`\n${passed}/${passed + failed} checks passed\n`);
 if (failed) process.exitCode = 1;

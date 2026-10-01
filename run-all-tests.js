@@ -38,7 +38,17 @@ let failed = 0;
 for (const suite of suites) {
   process.stdout.write(`\n=== ${suite.file} ===\n`);
   const command = suite.electron ? require("electron") : process.execPath;
-  const result = spawnSync(command, [path.join(__dirname, suite.file)], { stdio: "inherit", windowsHide: true });
+  // ELECTRON_RUN_AS_NODE makes electron.exe behave as plain Node -- no
+  // `app`, no BrowserWindow, nothing Electron-specific. If that var is set
+  // in the parent shell (observed in this dev environment), every
+  // `electron: true` suite silently ran as Node instead of real Electron,
+  // so `require("electron").app` was undefined and the suite failed for a
+  // reason that had nothing to do with its own correctness. Strip it only
+  // for suites that actually declared they need the real app module.
+  const env = suite.electron
+    ? Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "ELECTRON_RUN_AS_NODE"))
+    : process.env;
+  const result = spawnSync(command, [path.join(__dirname, suite.file)], { stdio: "inherit", windowsHide: true, env });
   if (result.error || result.status !== 0) {
     failed++;
     process.stderr.write(`FAIL ${suite.file}${result.error ? `: ${result.error.message}` : ` (exit ${result.status})`}\n`);
