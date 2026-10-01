@@ -370,5 +370,50 @@ function newStream(opts = {}) {
   });
 }
 
+// ---- Case 15: whole-shard silence, however long, stays HEALTHY --------
+// (1.25.37 audit) AGENTS.md §7: market silence alone is not failure, even
+// when EVERY tracked topic on the shard is quiet at once. checkOrderBlind()
+// used to flip this to DEGRADED via beginGap() after ORDER_BLIND_MS; it must
+// now be diagnostics-only -- no beginGap, no onTopicUnavailable, no REST,
+// no reconnect -- purely from the passage of time with zero transport
+// evidence of a problem.
+{
+  const { stream, unavailable } = newStream();
+  stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-a"));
+  stream.onSocketMessage(stream.activeSocket, stream.clientGeneration, ack("topic-b"));
+  unavailable.length = 0; // discard anything from the ACK sequence itself
+
+  const reconnectsBefore = stream.stats.reconnects || 0;
+  const gapsBefore = stream.stats.gapRecoveries || 0;
+
+  // No order event ever arrives on either topic. Simulate far longer than
+  // ORDER_BLIND_MS (90s) of pure silence by driving checkOrderBlind with a
+  // synthetic "now" well past the threshold -- no real timers, no real
+  // order events, nothing but elapsed time.
+  const farFuture = Date.now() + 10 * 60 * 1000; // 10 minutes of total silence
+  const result = stream.checkOrderBlind(farFuture);
+
+  check("checkOrderBlind never returns a truthy/actionable result from silence alone", () =>
+    assert.equal(result, false));
+  check("silence does not call beginGap (gapStartedAt stays unset)", () =>
+    assert.equal(stream.gapStartedAt, 0));
+  check("silence does not mark the shard subscription inactive", () =>
+    assert.equal(stream.subscriptionActive, true));
+  check("silence never fires onTopicUnavailable for either topic", () =>
+    assert.equal(unavailable.length, 0));
+  check("silence never schedules a reconnect", () =>
+    assert.equal(stream.stats.reconnects || 0, reconnectsBefore));
+  check("silence never counts as a gap recovery (because no gap was ever opened)", () =>
+    assert.equal(stream.stats.gapRecoveries || 0, gapsBefore));
+  check("both topics stay HEALTHY through extended silence", () => {
+    assert.equal(stream.healthForCollection("topic-a"), "HEALTHY");
+    assert.equal(stream.healthForCollection("topic-b"), "HEALTHY");
+  });
+  check("overall shard health() stays HEALTHY, not DEGRADED, through extended silence", () =>
+    assert.equal(stream.health(), "HEALTHY"));
+  check("silence is still counted as a bounded diagnostic, not silently dropped", () =>
+    assert.ok((stream.stats.silentShardTicks || 0) >= 1));
+}
+
 process.stdout.write(`\n${passed}/${passed + failed} checks passed\n`);
 if (failed) process.exitCode = 1;

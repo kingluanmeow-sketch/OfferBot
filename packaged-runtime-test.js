@@ -273,8 +273,8 @@ async function checkPackagedAppBoot() {
         returnByValue: true
       });
       const streamState = runtime.result.value || {};
-      check("packaged Stream subsystem initializes with official global SDK mode",
-        streamState.hasStream && streamState.mode === "official-global",
+      check("packaged Stream subsystem initializes with official per-collection SDK mode",
+        streamState.hasStream && streamState.mode === "official-collections",
         JSON.stringify(streamState));
       const uiDelta = await cdp.send("Runtime.evaluate", {
         expression: `(() => {

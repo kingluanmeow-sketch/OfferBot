@@ -1,11 +1,16 @@
 "use strict";
 
-// 1.25.30: a joined Stream that carries no order events is DEGRADED, not
-// HEALTHY, and the engine falls back to bounded targeted REST until order
-// events flow again. Observed live 2026-09-29: ACK ok, 0 order events.
+// 1.25.30 originally made a joined-but-eventless Stream DEGRADED after
+// ORDER_BLIND_MS of silence, with targeted REST fallback until events
+// resumed. 1.25.37 audit: AGENTS.md §7 ("market silence alone is not
+// failure") ruled that out -- a quiet market is not evidence anything
+// broke. checkOrderBlind() is now diagnostics-only: it never sets DEGRADED,
+// never opens a gap, never triggers REST/reconnect, no matter how long the
+// shard stays silent. See topic-lifecycle-test.js Case 15 for the per-topic
+// equivalent of this same contract.
 const assert = require("node:assert/strict");
 const { EventType } = require("@opensea/sdk/stream");
-const { OpenSeaStream, ORDER_BLIND_MS, ORDER_RESUME_EVENTS } = require("./stream-sdk");
+const { OpenSeaStream, ORDER_BLIND_MS } = require("./stream-sdk");
 const { OfferItemEngineV2, STATE } = require("./offer-item-v2/engine-v2");
 const { decide, STATUS } = require("./offer-item-v2/decision");
 
@@ -55,38 +60,28 @@ function joinedStream(callbacks = {}) {
       assert.equal(stream.health(), "HEALTHY");
       assert.equal(stream.checkOrderBlind(Date.now() + ORDER_BLIND_MS - 1000), false);
     });
+    const gapBefore = stream.gapStartedAt;
     stream.checkOrderBlind(Date.now() + ORDER_BLIND_MS + 1);
-    await check("ACK ok but no order events = DEGRADED, never HEALTHY", () => {
-      assert.equal(stream.health(), "DEGRADED");
-      assert.equal(stream.healthForCollection("alpha"), "DEGRADED");
-      assert.equal(stream.status().orderEventsBlind, true);
-      assert.equal(stream.status().subscriptionsActive, true, "the subscription itself is kept");
+    await check("ACK ok but no order events for a while stays HEALTHY (silence alone is not failure)", () => {
+      assert.equal(stream.health(), "HEALTHY");
+      assert.equal(stream.healthForCollection("alpha"), "HEALTHY");
+      assert.equal(stream.status().subscriptionsActive, true);
     });
-    await check("blindness opens targeted REST recovery for every tracked collection", () => {
-      assert.deepEqual(unavailable.sort(), ["alpha", "beta"]);
+    await check("silence never opens targeted REST recovery for tracked collections", () => {
+      assert.deepEqual(unavailable, []);
     });
     stream.checkOrderBlind(Date.now() + 10 * ORDER_BLIND_MS);
-    await check("blind detection is one outage, not repeated work", () => {
-      assert.equal(unavailable.length, 2);
-    });
-    // Live 2026-09-29: the SDK socket reconnects every few minutes while still
-    // blind. A re-ACK must not close the outage and reset every row's repair
-    // mark, or no REST read is ever newer than the mark and SEND stays blocked.
-    const gapBefore = stream.gapStartedAt;
-    stream.onGlobalSubscriptionReady();
-    await new Promise(r => setImmediate(r));
-    await check("re-ACK while still blind keeps the outage open (no repair reset)", () => {
-      assert.equal(stream.health(), "DEGRADED");
-      assert.deepEqual(recovered, []);
+    await check("even much longer silence opens no gap and triggers no recovery work", () => {
+      assert.equal(unavailable.length, 0);
       assert.equal(stream.gapStartedAt, gapBefore);
     });
-    for (let i = 0; i < ORDER_RESUME_EVENTS - 1; i++) captured.handler(bid("untracked", i));
-    await check("a few stray events do not end DEGRADED", () => assert.equal(stream.health(), "DEGRADED"));
-    captured.handler(bid("untracked", 99));
+    // A re-ACK (the SDK socket reconnects every few minutes in production)
+    // must not matter either way, since there was never an outage to close.
+    stream.onGlobalSubscriptionReady();
     await new Promise(r => setImmediate(r));
-    await check("order events flowing again return to Stream-first HEALTHY and reconcile once", () => {
+    await check("re-ACK after extended silence: still HEALTHY, nothing to recover", () => {
       assert.equal(stream.health(), "HEALTHY");
-      assert.deepEqual(recovered.sort(), ["alpha", "beta"]);
+      assert.deepEqual(recovered, []);
       assert.equal(stream.gapStartedAt, 0);
     });
     stream.stop();

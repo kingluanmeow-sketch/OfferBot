@@ -495,13 +495,6 @@ class OpenSeaStream {
     this.retryAttempt = 0;
     this.stats.resubscribeCount += wasEverActive ? 1 : 0;
     const gap = this.gapStartedAt;
-    // Still blind to order events: a re-ACK restores nothing the engine can
-    // use. Keep the outage open; noteOrderEvent closes it when events return.
-    if (gap && this.orderBlind) {
-      this.everActive = true;
-      logger.stream(`[STREAM] subscription re-ACK while order events are absent · stays DEGRADED`);
-      return;
-    }
     if (gap) {
       this.gapStartedAt = 0;
       this.stats.gapRecoveries++;
@@ -538,35 +531,38 @@ class OpenSeaStream {
     this.orderBlindTimer.unref?.();
   }
 
+  /**
+   * DIAGNOSTICS ONLY (1.25.37 audit).
+   *
+   *   Before this version, 90s of silence across the WHOLE shard set
+   *   `this.orderBlind = true` and called `beginGap(...)`, which made
+   *   `health()` report DEGRADED and opened targeted REST recovery for
+   *   every tracked topic -- purely because nobody traded for 90 seconds.
+   *   AGENTS.md §7 is explicit: market silence alone is not failure, and
+   *   that holds even when EVERY collection on a shard is quiet at once --
+   *   a slow market is not evidence the transport or subscription broke.
+   *
+   *   This still measures and counts silence (useful to tell "quiet
+   *   market" from "broken delivery" apart in logs/trace), but it no
+   *   longer ACTS on silence by itself: no `orderBlind`, no `beginGap`, no
+   *   reconnect, no REST. Health and recovery now come ONLY from transport/
+   *   subscription evidence -- socket close/error, failed heartbeat,
+   *   topic join refused/timeout, phx_error/phx_close -- all of which
+   *   already have their own evidence-based paths elsewhere in this file.
+   */
   checkOrderBlind(now = Date.now()) {
-    if (this.closedByUser || !this.subscriptionActive || this.orderBlind) return false;
-    if (now - Math.max(this.lastOrderEventAt, this.subscriptionActiveAt) < ORDER_BLIND_MS) return false;
-    this.orderBlind = true;
-    this.orderResumeTimes = [];
-    this.stats.orderBlindEntries = (this.stats.orderBlindEntries || 0) + 1;
-    logger.stream(`[STREAM] DEGRADED: subscription active but no order events for ${Math.round(ORDER_BLIND_MS / 1000)}s · targeted REST fallback ON`);
-    this.beginGap("order-events-blind", { keepSubscription: true });
-    return true;
+    if (this.closedByUser || !this.subscriptionActive) return false;
+    const silentMs = now - Math.max(this.lastOrderEventAt, this.subscriptionActiveAt);
+    if (silentMs < ORDER_BLIND_MS) return false;
+    this.stats.silentShardTicks = (this.stats.silentShardTicks || 0) + 1;
+    this.lastSilenceObservedMs = silentMs;
+    return false; // diagnostics only -- never true, never an action trigger
   }
 
+  /** Diagnostics only (see checkOrderBlind) -- just the last-seen timestamp,
+   *  no DEGRADED/resume state machine to drive anymore. */
   noteOrderEvent(now = Date.now()) {
     this.lastOrderEventAt = now;
-    if (!this.orderBlind) return;
-    this.orderResumeTimes.push(now);
-    while (this.orderResumeTimes.length && now - this.orderResumeTimes[0] > ORDER_RESUME_WINDOW_MS) this.orderResumeTimes.shift();
-    if (this.orderResumeTimes.length < ORDER_RESUME_EVENTS) return;
-    this.orderBlind = false;
-    this.orderResumeTimes = [];
-    const gap = this.gapStartedAt;
-    this.gapStartedAt = 0;
-    this.stats.gapRecoveries++;
-    logger.stream("[STREAM] order events flowing again · REST fallback OFF · Stream-first");
-    setImmediate(() => {
-      for (const slug of this.collections) {
-        try { this.onTopicGap(slug, gap, Date.now()); }
-        catch (error) { this.recordHandlerError(error, "order resume hook"); }
-      }
-    });
   }
 
   beginGap(reason, { keepSubscription = false } = {}) {
