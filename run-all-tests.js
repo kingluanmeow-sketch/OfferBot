@@ -27,6 +27,7 @@ const suites = [
   { file: "own-remove-grace-test.js" },
   { file: "priority-inversion-flight-test.js" },
   { file: "topic-lifecycle-test.js" },
+  { file: "own-authority-startup-test.js" },
   { file: "offer-item-v2-stress-test.js" },
   { file: "shared-credentials-bridge-test.js" },
   { file: "shared-credentials-hooks-test.js" },

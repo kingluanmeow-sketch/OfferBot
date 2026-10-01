@@ -214,6 +214,14 @@ const RETRY_BASE_MS = RETRY_POLICY.generic.base;
 const RETRY_MAX_MS = RETRY_POLICY.generic.max;
 /** Stream phải hỏng LIÊN TỤC bấy lâu mới bật đọc REST định kỳ (không bật vì một cú nối lại 1s). */
 const DEGRADED_GRACE_MS = 15 * 1000;
+/**
+ * How long a cold row waits on the shared wallet-wide own-authority
+ * snapshot before falling back to its own per-token read (1.25.38). The
+ * common case (clean wallet listing, no cursor loop) resolves in 1-6 fast
+ * paginated requests well under this; a genuinely large/looping wallet
+ * falls back per-row instead of leaving every row blocked on one slow job.
+ */
+const OWN_WALLET_SNAPSHOT_GRACE_MS = 6000;
 /** Ý định WAITING lâu hơn thế mà không ai tính lại: airbag của watchdog (đếm). */
 const WAITING_STUCK_MS = 60 * 1000;
 /** Nhịp quét thử-lại và watchdog; rẻ, unref, chỉ khi RUNNING. */
@@ -534,6 +542,20 @@ class OfferItemEngineV2 {
     this.ownUnknownAt = 0;
     this.ownSyncPending = false;
     this.ownSyncRetryTimer = null;
+    /**
+     * tokenKey -> bounded grace timer for a cold row deferred onto the
+     * shared wallet-wide own-authority snapshot (1.25.38 root-cause fix).
+     * With 100+ tracked NFTs, every row going cold at once used to queue
+     * its own per-token REST read immediately -- one dedicated request per
+     * NFT, 10-75s to drain through the shared read budget. Now a cold row
+     * joins the one paginated wallet snapshot (queueOwnResync) instead; this
+     * timer is the per-row escape hatch if THIS row specifically is still
+     * uncovered once the snapshot had a fair chance to answer for it (a
+     * genuinely large/looping wallet, not the common case), falling back to
+     * exactly the per-token read this row would have issued immediately
+     * before. See deferForOwnSync.
+     */
+    this.ownWaitTimers = new Map();
     /** tokenKey -> timer hẹn đọc lại lượt đầu; để reset dọn và watchdog biết. */
     this.firstReadTimers = new Map();
     /** tokenKey -> lần cuối đọc lại vì top bị huỷ (gap recovery). */
@@ -943,9 +965,13 @@ class OfferItemEngineV2 {
 
     // Own resync lúc prewarm trả về từng phần (cursor ví lặp): phần còn lại
     // tiếp tục ở NỀN, chỉ cho những hàng chưa soát. Hàng đã soát gửi ngay.
+    // Dùng reason "pre-post-own" (không phải "prewarm") để job này có priority
+    // 1 giống job mà deferForOwnSync xếp — đây CHÍNH LÀ job các hàng lạnh lúc
+    // Start đang chờ (1.25.38): xếp nó ở P3 trong khi 100 lượt đọc riêng từng
+    // hàng tranh P1 là lý do snapshot ví rẻ bị bỏ đói phía sau việc đắt hơn.
     if (this.prewarmOwnIncomplete) {
       this.prewarmOwnIncomplete = false;
-      this.queueOwnResync("prewarm");
+      this.queueOwnResync("pre-post-own");
     }
 
     // ---- 5. đọc trạng thái hiện tại, ở NỀN --------------------------
@@ -1490,6 +1516,8 @@ class OfferItemEngineV2 {
     this.stopLoops();
     for (const timer of this.firstReadTimers.values()) clearTimeout(timer);
     this.firstReadTimers.clear();
+    for (const timer of this.ownWaitTimers.values()) clearTimeout(timer);
+    this.ownWaitTimers.clear();
     this.inFlightSince.clear();
     for (const pr of this.pendingReads.values()) if (pr.timer) clearTimeout(pr.timer);
     this.pendingReads.clear();
@@ -1568,6 +1596,9 @@ class OfferItemEngineV2 {
     const ft = this.firstReadTimers.get(key);
     if (ft) clearTimeout(ft);
     this.firstReadTimers.delete(key);
+    const owt = this.ownWaitTimers.get(key);
+    if (owt) clearTimeout(owt);
+    this.ownWaitTimers.delete(key);
     this.clearHydrating(key);
     this.awaitingFirstRead.delete(key);
     this.downwardAuthority.delete(key);
@@ -2429,15 +2460,28 @@ class OfferItemEngineV2 {
     // đầy đủ của token là một lượt kiểm own trọn vẹn). Hàng lạnh chưa từng
     // được soát: đồng bộ own ưu tiên P1 cho những hàng còn mơ hồ.
     /**
-     * OWN AUTHORITY THEO TỪNG HÀNG (1.25.2)
+     * OWN AUTHORITY: SNAPSHOT VÍ TRƯỚC, TỪNG HÀNG LÀ LỐI THOÁT CÓ GIỚI HẠN
+     * (1.25.38 root-cause fix)
      *
-     *   1.25.1 giao hàng lạnh cho `queueOwnResync("pre-post-own")`: MỘT job
-     *   ví + collection + đọc từng NFT cho 60–90 hàng chưa soát, hết hạn 120s,
-     *   rơi, xếp lại — trong lúc đó hàng cần gửi nằm WAITING (production:
-     *   waitOwn=14→23, "already-pending-or-unavailable" lặp). Nay chủ của chờ
-     *   đợi là MỘT lượt đọc ĐẦY ĐỦ của đúng token này (P1): danh sách đầy đủ
-     *   chứng minh own của token → ownReconciledAt → settle tính lại → gửi.
-     *   Resync toàn ví chỉ còn là tối ưu nền P3.
+     *   1.25.1 giao MỌI hàng lạnh cho `queueOwnResync`: một job ví+collection+
+     *   từng NFT, hết hạn 120s — một job chậm/kẹt làm MỌI hàng đứng im.
+     *   1.25.2 sửa quá tay: MỌI hàng lạnh tự xin lượt đọc riêng của mình
+     *   (P1) — đúng với 1-2 hàng, nhưng với 100+ hàng cùng lạnh lúc Start,
+     *   đó là 100 lượt đọc riêng cạnh tranh cùng ngân sách đọc, 10–75s mỗi
+     *   hàng mới tới lượt (production, v1.25.38 audit).
+     *
+     *   Nay: hàng lạnh THƯỜNG (không mơ hồ vì POST) xin NHẬP vào một snapshot
+     *   ví có phân trang dùng chung (`queueOwnResync`, P1) — trường hợp
+     *   thường (ví sạch, không lặp cursor) xong trong 1–6 request, mở khoá
+     *   CẢ TRĂM hàng gần như cùng lúc. Đồng hồ `OWN_WALLET_SNAPSHOT_GRACE_MS`
+     *   là lối thoát CÓ GIỚI HẠN cho đúng hàng đó nếu nó vẫn chưa được
+     *   snapshot phủ tới (ví lớn/lặp cursor — tầng 2/3 của resyncOwnOrders) —
+     *   không phải mọi hàng cùng rơi về 100 lượt đọc như 1.25.2, và không
+     *   phải mọi hàng cùng kẹt sau một job chậm như 1.25.1.
+     *
+     *   POST mơ hồ của CHÍNH hàng này (rowAmbiguous) vẫn luôn đọc riêng
+     *   ngay: một snapshot cũ hơn lần POST đó không thể chứng minh được gì
+     *   về nó.
      */
     const book = this.book.get(key);
     const rowAmbiguous = book && (book.ownUnknownAt || 0) > 0 &&
@@ -2445,13 +2489,35 @@ class OfferItemEngineV2 {
     const readReason = rowAmbiguous ? "post-uncertain" : "pre-post-own";
     const intentNow = this.intents.get(key);
     if (intentNow) intentNow.dependency = readReason === "post-uncertain" ? "post-reconcile" : "own";
-    // Không có đường đọc token (adapter không có fetchBest): chủ duy nhất có
-    // thể là resync ví — không xếp một lượt đọc không bao giờ chạy được.
-    const queued = typeof this.adapter.fetchBest !== "function"
-      ? (this.queueOwnResync("pre-post-own") || this.ownSyncPending)
-      : (this.queueRead(row, { reason: readReason, authoritative: false, readAt: Date.now(), firstRead: false, attempt: 1,
-          correlationId: intent.correlationId }) ||
-        this.hydrating.has(key) || this.pendingReads.has(key));
+    const queueOwnRowRead = () => this.queueRead(row, { reason: readReason, authoritative: false, readAt: Date.now(), firstRead: false, attempt: 1,
+      correlationId: intent.correlationId }) || this.hydrating.has(key) || this.pendingReads.has(key);
+    let queued;
+    if (rowAmbiguous || typeof this.adapter.fetchBest !== "function") {
+      // POST-ambiguous: only this token's own full read proves anything
+      // newer than the ambiguous POST. No fetchBest at all: the wallet
+      // snapshot is the only read path there is, use it directly.
+      queued = rowAmbiguous ? queueOwnRowRead()
+        : (this.queueOwnResync("pre-post-own") || this.ownSyncPending);
+    } else {
+      // Common cold-start case: join the shared wallet snapshot instead of
+      // a dedicated per-token read. Bounded grace timer below is the
+      // per-row fallback if the snapshot genuinely doesn't cover this row.
+      this.queueOwnResync("pre-post-own");
+      queued = this.ownSyncPending || (this.ownSyncAt || 0) > 0;
+      if (!this.ownWaitTimers.has(key)) {
+        const timer = setTimeout(() => {
+          this.ownWaitTimers.delete(key);
+          if (!this.rows.has(key) || this.ownAuthoritative(key)) return;
+          const liveIntent = this.intents.get(key);
+          if (!liveIntent || liveIntent.state !== INTENT.WAITING || liveIntent.dependency !== "own") return;
+          this.stats.ownWaitFallback = (this.stats.ownWaitFallback || 0) + 1;
+          this.log(`[DIAG] own-wait fallback NFT #${row.tokenId}: wallet snapshot hasn't covered it after ${OWN_WALLET_SNAPSHOT_GRACE_MS}ms`);
+          queueOwnRowRead();
+        }, OWN_WALLET_SNAPSHOT_GRACE_MS);
+        timer.unref?.();
+        this.ownWaitTimers.set(key, timer);
+      }
+    }
     productionTrace.record("own_state", { correlationId: intent.correlationId }, {
       chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
       status: "WAITING", reason: "own-state-unknown", target: intent.target,
