@@ -11,6 +11,11 @@ const EVENTS = new Set(["item_received_bid", "collection_offer", "trait_offer", 
 const STAGES = new Set(["stream_rx", "stream_mapped", "book_update", "decision", "intent", "blocked", "own_state", "own_update", "send_queued", "http_start", "submit_success", "submit_failure", "rest_request", "rest_response", "bootstrap"]);
 const REASONS = new Set(["SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "topic-not-ready", "shadow-authority-required", "low-balance", "first-read", "template", "own-state-unknown", "not-applied", "applied", "http", "stale-before-post", "quota", "build", "cancelled", "other"]);
 const STATUSES = new Set(["mapped", "scope-event", "decode-failed", "applied", "not-applied", "covered", "uncovered", "SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "READY", "WAITING", "QUEUED", "POST", "SUCCESS", "FAILED"]);
+// Which independent Stream connection delivered this event (1.25.40 dual-feed
+// redundancy). Lets a production trace distinguish "feed A never got this"
+// from "feed A got it, feed B also got it" from raw stream_rx rows alone.
+const FEEDS = new Set(["A", "B", ""]);
+const cleanOrderHash = value => { const s = String(value || "").toLowerCase(); return /^0x[a-f0-9]{1,128}$/.test(s) ? s : ""; };
 const SOURCES = new Set(["STREAM", "DEGRADED_REST", "REST"]);
 let filePath = "", queue = [], scheduled = false, flushing = false, dropped = 0;
 const cleanSlug = value => { const s = String(value || "").toLowerCase(); return /^[a-z0-9][a-z0-9-]{0,99}$/.test(s) ? s : ""; };
@@ -45,7 +50,9 @@ function record(stage, event, detail = {}) {
     eventTimestamp: cleanNumber(event && event.eventTimestamp),
     source: SOURCES.has(detail.source) ? detail.source : "",
     tTotal: cleanNumber(detail.tTotal), tTemplate: cleanNumber(detail.tTemplate), tFirstRead: cleanNumber(detail.tFirstRead),
-    tDecision: cleanNumber(detail.tDecision), tQueued: cleanNumber(detail.tQueued)
+    tDecision: cleanNumber(detail.tDecision), tQueued: cleanNumber(detail.tQueued),
+    orderHash: cleanOrderHash(detail.orderHash),
+    feed: FEEDS.has(detail.feed) ? detail.feed : ""
   };
   queue.push(JSON.stringify(row) + "\n"); schedule(); return true;
 }

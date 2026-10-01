@@ -75,7 +75,7 @@ const linkList = require("./link-list");
 const { profiler } = require("./latency");
 const browser = require("./browser");
 const wallet = require("./wallet");
-const { ShardedOpenSeaStream: OpenSeaStream } = require("./stream-sdk");
+const { ShardedOpenSeaStream: OpenSeaStream, OpenSeaStream: SingleOpenSeaStream } = require("./stream-sdk");
 /**
  * ENGINE OFFER ITEM CŨ KHÔNG CÒN TRONG SẢN PHẨM
  *
@@ -112,6 +112,29 @@ const { AddBatchGate } = require("./add-batch-gate");
 let mainWindow = null;
 let db = null;
 let stream = null;
+/**
+ * REDUNDANT SECOND FEED (1.25.40)
+ *
+ *   OpenSea's Stream is best-effort; a missed `item_received_bid` is not
+ *   replayed, and the topic/socket can stay fully healthy while one specific
+ *   event is simply never delivered (confirmed in production: goblintownwtf
+ *   #1810, fwogs #2120/#3718 -- topic kept receiving OTHER events on the
+ *   same collection throughout, so this is not an outage the existing
+ *   health/reconnect machinery can see or fix).
+ *
+ *   `streamB` is a second, fully independent connection on the SECOND
+ *   configured API key (when one exists), subscribed to the same
+ *   collections, feeding the SAME MemoryBook through the SAME dispatch path
+ *   as `stream`. It does not replace `stream` or its health/recovery
+ *   authority -- that stays exactly as before, unchanged, scoped to `stream`
+ *   alone, so this remains the smallest safe addition rather than a rewrite
+ *   of the hardened primary path. It exists purely so that a message
+ *   OpenSea failed to deliver on one socket has an independent second
+ *   chance on a second socket; `book.apply`'s order-hash-keyed upsert
+ *   already makes applying the same order twice harmless, and streamDedupe
+ *   below adds an explicit counter for it.
+ */
+let streamB = null;
 let remoteHost = null;
 
 /** Exactly-once protection for Add NFT IPC retries and double UI callbacks. */
@@ -525,7 +548,7 @@ async function remoteCommand(payload = {}) {
     if (!urls?.length) return { ok: false, error: "Chưa chọn NFT." };
     for (const url of urls) engine.removeRow(url);
     const result = db.deleteNfts(chain, urls);
-    if (stream) stream.setCollections(allCollectionSlugs());
+    syncStreamCollections();
     engine.emitNow();
     return result;
   }
@@ -613,7 +636,7 @@ function resolveRemoteMeta(chain, engine, entries) {
         logger.engine(`[REMOTE ADD] #${parsed.tokenId} metadata: ${opensea.describeError(error)}`);
       }
     }
-    if (slugAdded && stream) stream.setCollections(allCollectionSlugs());
+    if (slugAdded) syncStreamCollections();
     try { engine.emitNow(); } catch { /* engine đang đóng */ }
   })().catch(error => logger.error(`[REMOTE ADD] metadata: ${error.message}`));
 }
@@ -879,6 +902,9 @@ function applySettings() {
     stream.refreshKey();
     stream.setCollections(allCollectionSlugs());
   }
+  // Settings may have added, removed, or changed the second key: bring feed
+  // B up, down, or onto the new key to match.
+  if (stream) ensureStreamB();
 
   return settings;
 }
@@ -966,8 +992,70 @@ function allCollectionSlugs() {
  * single summary line is emitted on a timer. Events that actually hit a watched
  * NFT are still logged individually by the engine as [STREAM PRIORITY].
  */
-const streamCounters = { total: 0, promoted: 0, byEvent: new Map() };
+const streamCounters = {
+  total: 0, promoted: 0, byEvent: new Map(),
+  // Per-feed redundancy diagnostics (1.25.40). `received` counts every event
+  // a feed delivered; `duplicate` counts a (event,orderHash) pair already
+  // seen recently from either feed (book.apply's own content-equality check
+  // makes a duplicate harmless -- this is purely visibility); `uniqueRecovered`
+  // counts an event whose FIRST delivery came from the non-primary feed B --
+  // direct evidence of something the primary feed alone would have missed
+  // (or at least not yet delivered). `droppedStale` approximates events that
+  // turned out to be pure redelivery (the specific case this mechanism exists
+  // to catch is the opposite -- a message OpenSea never redelivers at all --
+  // which by definition this counter cannot see; it is bounded to what is
+  // observable from this process).
+  byFeed: { A: { received: 0 }, B: { received: 0 } },
+  duplicate: 0, crossFeedDuplicate: 0, uniqueRecovered: 0
+};
 const STREAM_SUMMARY_MS = 30 * 1000;
+/** (event,orderHash) -> {feed, at}. Pruned on the same timer as the summary log. */
+const recentStreamEvents = new Map();
+const STREAM_DEDUPE_WINDOW_MS = 60 * 1000;
+
+/**
+ * Shared dispatch for both feeds (1.25.40). Both feeds feed the exact same
+ * engines/MemoryBook through the exact same path -- there is no separate
+ * "feed B" decision logic, because MemoryBook.apply is already
+ * order-hash-keyed and rejects a content-identical redelivery as "nothing
+ * new" (see memory-book.js apply(): `before.price === record.price &&
+ * before.endTime === record.endTime` -> no-op, no generation bump, no
+ * re-decision). That is the real dedupe; the bookkeeping below is
+ * diagnostics only and never gates whether an event reaches the engines.
+ */
+function dispatchStreamEvent(decoded, feedId) {
+  if (decoded && typeof decoded === "object") decoded.feed = feedId;
+  const key = decoded && decoded.orderHash ? `${decoded.event}:${decoded.orderHash}` : "";
+  if (key) {
+    const prior = recentStreamEvents.get(key);
+    if (prior) {
+      streamCounters.duplicate++;
+      if (prior.feed !== feedId) streamCounters.crossFeedDuplicate++;
+    } else if (feedId === "B") {
+      // First time this (event,orderHash) has been seen at all, and it came
+      // in on the redundant feed, not the primary one.
+      streamCounters.uniqueRecovered++;
+    }
+    recentStreamEvents.set(key, { feed: feedId, at: Date.now() });
+  }
+  (streamCounters.byFeed[feedId] || (streamCounters.byFeed[feedId] = { received: 0 })).received++;
+
+  // One event can touch both chains; each engine filters by its own rows.
+  let promoted = 0;
+  for (const engine of engines.values()) {
+    try {
+      promoted += engine.handleStreamEvent(decoded);
+    } catch (error) {
+      logger.error(`stream dispatch: ${error.message}`);
+    }
+  }
+
+  streamCounters.total++;
+  if (promoted) streamCounters.promoted += promoted;
+
+  const seen = streamCounters.byEvent.get(decoded.event) || 0;
+  streamCounters.byEvent.set(decoded.event, seen + 1);
+}
 
 function startStream() {
   stream = new OpenSeaStream({
@@ -1018,28 +1106,15 @@ function startStream() {
       }
     },
 
-    onEvent: decoded => {
-      // One event can touch both chains; each engine filters by its own rows.
-      let promoted = 0;
-      for (const engine of engines.values()) {
-        try {
-          promoted += engine.handleStreamEvent(decoded);
-        } catch (error) {
-          logger.error(`stream dispatch: ${error.message}`);
-        }
-      }
-
-      streamCounters.total++;
-      if (promoted) streamCounters.promoted += promoted;
-
-      const seen = streamCounters.byEvent.get(decoded.event) || 0;
-      streamCounters.byEvent.set(decoded.event, seen + 1);
-    }
+    onEvent: decoded => dispatchStreamEvent(decoded, "A")
   });
 
   // Every engine can now ask how the stream is. That is what lets
   // reconciliation stand down while the stream is delivering, and step back up
-  // the moment it is not.
+  // the moment it is not. This stays scoped to feed A alone, unchanged --
+  // feed B (below) is a pure event-redundancy backstop and does not
+  // participate in health/recovery authority, so that hardened, already-
+  // proven state machine is not touched by adding it.
   for (const engine of engines.values()) {
     engine.attachStreamHealth(slug => (stream
       ? (slug ? stream.healthForCollection(slug) : stream.health())
@@ -1047,10 +1122,14 @@ function startStream() {
   }
 
   stream.start(allCollectionSlugs());
+  ensureStreamB();
 
   installPowerHooks();
 
   const summary = setInterval(() => {
+    const dedupeCutoff = Date.now() - STREAM_DEDUPE_WINDOW_MS;
+    for (const [key, entry] of recentStreamEvents) if (entry.at < dedupeCutoff) recentStreamEvents.delete(key);
+
     if (!streamCounters.total) return;
 
     const breakdown = Array.from(streamCounters.byEvent)
@@ -1060,7 +1139,9 @@ function startStream() {
 
     logger.stream(
       `${streamCounters.total} events / ${STREAM_SUMMARY_MS / 1000}s, ` +
-        `${streamCounters.promoted} priority scan(s) | ${breakdown}`
+        `${streamCounters.promoted} priority scan(s) | ${breakdown}` +
+        (streamB ? ` | feedA=${streamCounters.byFeed.A.received} feedB=${streamCounters.byFeed.B.received} ` +
+          `dup=${streamCounters.duplicate}(cross=${streamCounters.crossFeedDuplicate}) uniqueRecovered=${streamCounters.uniqueRecovered}` : "")
     );
 
     streamCounters.total = 0;
@@ -1069,6 +1150,44 @@ function startStream() {
   }, STREAM_SUMMARY_MS);
   summary.unref?.();
   timers.push(summary);
+}
+
+/** Keep both feeds subscribed to the same collection set. */
+function syncStreamCollections() {
+  if (stream) stream.setCollections(allCollectionSlugs());
+  if (streamB) streamB.setCollections(allCollectionSlugs());
+}
+
+/**
+ * (Re)establish feed B against whichever key is currently in the secondary
+ * slot. Idempotent: a no-op if feed B already exists and the configured
+ * secondary key has not changed signature. Called at Start and whenever
+ * Settings may have changed the key pool, so a second key added after Start
+ * gets redundancy without a restart, and a removed one tears feed B down
+ * rather than leaving it running on a stale/invalid key.
+ */
+function ensureStreamB() {
+  const secondKey = rateLimiter.apiKeys.secondary();
+  if (!secondKey || !secondKey.key) {
+    if (streamB) { try { streamB.stop(); } catch { /* already down */ } streamB = null; }
+    return;
+  }
+  if (streamB) { streamB.setCollections(allCollectionSlugs()); streamB.refreshKey(); return; }
+  streamB = new SingleOpenSeaStream({
+    getApiKey: () => (rateLimiter.apiKeys.secondary() || {}).key || "",
+    getKeySignature: () => {
+      const k = rateLimiter.apiKeys.secondary();
+      return k ? `b:${k.fp || k.key}` : "";
+    },
+    isKeyConfigured: key => Boolean(rateLimiter.apiKeys.find(key)),
+    // No onTopicGap/onTopicUnavailable/onTopicJoined wiring to engines: feed
+    // B never drives recovery/health authority (see the comment on `let
+    // streamB` above). Its own reconnect/backoff is fully internal and
+    // independent of feed A.
+    onEvent: decoded => dispatchStreamEvent(decoded, "B")
+  });
+  streamB.start(allCollectionSlugs());
+  logger.stream(`[STREAM] second feed active on Key ${secondKey.slot} (fp=${secondKey.fp}) -- redundant event delivery only`);
 }
 
 // ------------------------------------------------------------------
@@ -1291,6 +1410,8 @@ function shutdownApp(reason) {
 
   for (const timer of timers) clearInterval(timer);
   try { if (stream) stream.stop(); } catch { /* already down */ }
+  try { if (streamB) streamB.stop(); } catch { /* already down */ }
+  streamB = null;
   for (const engine of engines.values()) {
     try { engine.shutdown(); } catch { /* already down */ }
   }
@@ -1835,7 +1956,7 @@ function fullState() {
     license: license.status(),
     api: apiStatus(),
     walletSessions: [],
-    stream: stream ? stream.status() : { connected: false },
+    stream: stream ? stream.status() : { connected: false }, streamB: streamB ? streamB.status() : null, streamRedundancy: { byFeed: streamCounters.byFeed, duplicate: streamCounters.duplicate, crossFeedDuplicate: streamCounters.crossFeedDuplicate, uniqueRecovered: streamCounters.uniqueRecovered },
     limiter: rateLimiter.stats()
   };
 }
@@ -2593,7 +2714,7 @@ function registerIpc() {
       `${chain}: xu ly ${parsedLinks.length} link trong ${Date.now() - startedAt}ms`
     );
 
-    if (added.length && stream) stream.setCollections(allCollectionSlugs());
+    if (added.length) syncStreamCollections();
 
     engine.emitNow();
     logger.engine(
@@ -2644,7 +2765,7 @@ function registerIpc() {
     engine.removeRow(payload?.url);
     const result = db.deleteNft(chain, payload?.url);
 
-    if (stream) stream.setCollections(allCollectionSlugs());
+    syncStreamCollections();
     engine.emitNow();
     return result;
   });
@@ -2657,7 +2778,7 @@ function registerIpc() {
     for (const url of urls) engine.removeRow(url);
     const result = db.deleteNfts(chain, urls);
 
-    if (stream) stream.setCollections(allCollectionSlugs());
+    syncStreamCollections();
     engine.emitNow();
     return result;
   });
@@ -2825,7 +2946,7 @@ function registerIpc() {
     limiter: rateLimiter.stats(),
     caches: cache.statsAll(),
     logger: logger.stats(),
-    stream: stream ? stream.status() : { connected: false },
+    stream: stream ? stream.status() : { connected: false }, streamB: streamB ? streamB.status() : null,
     engines: Array.from(engines.values()).map(e => engineDiagnostics(e).engine),
     runtime: {
       appIsPackaged: Boolean(app.isPackaged),

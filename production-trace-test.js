@@ -16,7 +16,7 @@ async function main() {
     trace.record("stream_rx", event, {
       event: event.event, collection: "alpha", tokenId: "42",
       apiKey: "SHOULD_NEVER_BE_WRITTEN", privateKey: "SHOULD_NEVER_BE_WRITTEN",
-      status: "mapped"
+      status: "mapped", orderHash: "0xabc123", feed: "B"
     });
     trace.record("own_state", event, {
       ownAuthoritative: false, ownSyncPending: true, ownSyncAt: 10,
@@ -32,12 +32,22 @@ async function main() {
     assert.equal(row.collection, "alpha");
     assert.equal(row.tokenId, "42");
     assert.equal(row.eventTimestamp, 1234);
+    assert.equal(row.orderHash, "0xabc123");
+    assert.equal(row.feed, "B");
     const own = JSON.parse(lines[1]);
     assert.equal(own.stage, "own_state");
     assert.equal(own.ownAuthoritative, false);
     assert.equal(own.ownSyncPending, true);
     assert.equal(own.ownReadOwned, true);
     assert(!saved.includes("SHOULD_NEVER_BE_WRITTEN"));
+
+    trace.record("stream_rx", event, { feed: "not-a-real-feed", orderHash: "javascript:alert(1)" });
+    await trace.flush();
+    const saved2 = await fs.readFile(file, "utf8");
+    const lines2 = saved2.trim().split("\n");
+    const badRow = JSON.parse(lines2[lines2.length - 1]);
+    assert.equal(badRow.feed, "", "an unrecognized feed value must be dropped, not passed through");
+    assert.equal(badRow.orderHash, "", "a non-hash orderHash must be dropped, not passed through");
 
     await fs.writeFile(file, Buffer.alloc(trace.MAX_FILE_BYTES));
     trace.record("decision", event, { status: "SEND", target: 0.011, max: 0.02 });

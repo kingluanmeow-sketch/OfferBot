@@ -1858,6 +1858,25 @@ class OfferItemEngineV2 {
     const trackedNftKey = op.contract && op.tokenId ? this.book.byNft?.get(`${op.contract}:${op.tokenId}`) : null;
     const preEventBook = trackedNftKey ? this.book.get(trackedNftKey) : null;
     const preEventBest = preEventBook ? preEventBook.effectiveBest(receivedAt).price : 0;
+    /**
+     * UNCONDITIONAL RECEIPT TRACE FOR TRACKED NFTS (1.25.40)
+     *
+     *   Production audit: three confirmed cases of a competing bid silently
+     *   missing from the book while topic/socket health stayed HEALTHY and
+     *   the same collection kept delivering other events the whole time.
+     *   Before this, the only per-event trace write was `book_update`,
+     *   gated on `touched.length` -- so there was no way to tell "OpenSea
+     *   never sent this event" apart from "we received it and book.apply
+     *   silently rejected it" (stale/tombstoned/older-seq/no-op). This write
+     *   is unconditional (fires whether or not apply ends up changing
+     *   anything) but still bounded to TRACKED NFTs only, same I/O bound as
+     *   book_update already uses (~8 MB/min otherwise, see the comment at
+     *   the untracked-event counter below).
+     */
+    if (trackedNftKey) productionTrace.record("stream_rx", event, {
+      chain: this.chain, collection: op.collectionSlug || event.collectionSlug,
+      tokenId: op.tokenId, orderHash: op.orderHash || "", status: "mapped", feed: event.feed || ""
+    });
     const touched = this.book.apply(op, receivedAt);
     const trackedBookAfter = trackedNftKey ? this.book.get(trackedNftKey) : null;
     if (touched.length) productionTrace.record("book_update", event, {
