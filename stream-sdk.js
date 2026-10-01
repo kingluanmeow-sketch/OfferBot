@@ -22,6 +22,11 @@ const EVENT_TYPES = Object.freeze([
 // competitors, so it is DEGRADED (targeted REST fallback) until order events
 // are flowing again. Market-wide counts: tracked collections can be quiet.
 const ORDER_BLIND_MS = 90 * 1000;
+// Same bound as the existing shard-wide watchGlobalJoinAck -- a topic that
+// has not received its OWN join reply within this window is evidence-based
+// "not joined", not a guess: OpenSea either answers phx_reply quickly or the
+// request was lost. Scoped to one topic; a sibling's ACK never resets it.
+const TOPIC_JOIN_ACK_MS = 12000;
 const ORDER_RESUME_EVENTS = 5;
 const ORDER_RESUME_WINDOW_MS = 60 * 1000;
 const CONTROL_EVENTS = new Set(["phx_reply", "phx_error", "phx_close", "phx_join", "phx_leave", "heartbeat"]);
@@ -84,6 +89,37 @@ class OpenSeaStream {
     this.trackedSlugs = new Set();
     this.reconnectTimer = null;
     this.joinAckTimer = null;
+    /**
+     * PER-TOPIC LIFECYCLE (1.25.35)
+     *
+     *   `subscriptionActive` is SOCKET-level truth (transport open, at least
+     *   one join ACK seen) — that part stays, it is real evidence. The bug
+     *   was using it as a STAND-IN for "every topic on this socket is
+     *   joined": the first topic to ACK flips it true, and a sibling topic
+     *   whose OWN join reply never arrives (not refused — just never
+     *   replied) has no distinguishing signal afterward. `healthForCollection`
+     *   then reports HEALTHY for a topic OpenSea never actually joined us to.
+     *
+     *   slug -> { state: JOINING|ACKED|REFUSED, ackedAt, joinedOnce }
+     *   JOINING  just subscribed, its own ACK not seen yet.
+     *   ACKED    its own `phx_reply status=ok` arrived.
+     *   REFUSED  its own `phx_reply` arrived with a non-ok status, OR its
+     *            join ACK timed out (evidence either way, never silence
+     *            alone — see topicJoinTimers below).
+     *
+     *   Only meaningful in `perCollection` mode, where each topic gets its
+     *   own join frame and its own reply. In global `collection:*` mode
+     *   there is exactly one topic and the existing shard-wide signal
+     *   already describes it correctly.
+     */
+    this.topicState = new Map();
+    /** slug -> timer. Scoped join-ACK timeout, one per topic, independent of
+     *  every other topic's — a sibling ACKing does not cancel this one. */
+    this.topicJoinTimers = new Map();
+    /** slug -> last matched-event ms. DIAGNOSTICS ONLY (health()/trace) — a
+     *  quiet topic is not evidence of failure (AGENTS.md "market silence is
+     *  not failure"); nothing here ever triggers reconnect/REST on its own. */
+    this.lastEventAtBySlug = new Map();
     this.retryAttempt = 0;
     this.eventSequence = 0;
     this.orderBlind = false;
@@ -196,6 +232,48 @@ class OpenSeaStream {
   subscribeTopic(slug, generation = this.clientGeneration) {
     if (!this.client || this.topicUnsubs.has(slug)) return;
     this.topicUnsubs.set(slug, this.client.onEvents(slug, this.eventTypes(), event => this.handleSdkEvent(generation, event)));
+    this.topicState.set(slug, { state: "JOINING", ackedAt: 0 });
+    this.watchTopicJoinAck(slug, generation);
+  }
+
+  /** One join-ACK timeout per topic. A sibling topic's ACK never cancels or
+   *  resets this one -- that independence is the whole fix. */
+  watchTopicJoinAck(slug, generation) {
+    const old = this.topicJoinTimers.get(slug);
+    if (old) clearTimeout(old);
+    const timer = setTimeout(() => {
+      this.topicJoinTimers.delete(slug);
+      if (generation !== this.clientGeneration || this.closedByUser) return;
+      const entry = this.topicState.get(slug);
+      if (!entry || entry.state !== "JOINING") return; // already ACKED/REFUSED by its own reply
+      this.stats.joinRefused++;
+      logger.stream(`[STREAM] topic ${safeText(slug, 80)} join ACK timeout${this.label} · scoped rejoin`);
+      entry.state = "REFUSED";
+      try { this.onTopicUnavailable(slug, Date.now(), "topic-join-ack-timeout"); } catch (error) { this.recordHandlerError(error, "topic ack-timeout hook"); }
+      this.rejoinTopic(slug, generation);
+    }, TOPIC_JOIN_ACK_MS);
+    timer.unref?.();
+    this.topicJoinTimers.set(slug, timer);
+  }
+
+  /** Scoped recovery for ONE topic: drop and resubscribe just that topic on
+   *  the live socket. Does not touch the socket, other topics, or their
+   *  state -- the isolation AGENTS.md §7/§8 requires. */
+  rejoinTopic(slug, generation) {
+    if (generation !== this.clientGeneration || this.closedByUser || !this.client) return;
+    if (!this.collections.has(slug)) return; // removed while the timer was pending
+    const unsub = this.topicUnsubs.get(slug);
+    if (unsub) { try { unsub(); } catch {} }
+    this.topicUnsubs.delete(slug);
+    this.subscribeTopic(slug, generation);
+  }
+
+  clearTopicState(slug) {
+    const timer = this.topicJoinTimers.get(slug);
+    if (timer) clearTimeout(timer);
+    this.topicJoinTimers.delete(slug);
+    this.topicState.delete(slug);
+    this.lastEventAtBySlug.delete(slug);
   }
 
   /** Per-collection mode: add/remove topics on the live socket, no restart. */
@@ -205,6 +283,7 @@ class OpenSeaStream {
       try { unsub(); } catch {}
       this.topicUnsubs.delete(slug);
       this.refusedTopics.delete(slug);
+      this.clearTopicState(slug);
     }
     for (const slug of this.collections) this.subscribeTopic(slug);
   }
@@ -297,12 +376,30 @@ class OpenSeaStream {
     if (this.perCollection && type === "phx_reply" && topic.startsWith("collection:") && topic !== "collection:*") {
       const slug = topic.slice("collection:".length);
       const status = String(frame[4] && frame[4].status || "").toLowerCase();
+      const timer = this.topicJoinTimers.get(slug);
+      if (timer) { clearTimeout(timer); this.topicJoinTimers.delete(slug); }
       if (status === "ok") {
         this.refusedTopics.delete(slug);
+        const entry = this.topicState.get(slug) || {};
+        const wasJoined = entry.joinedOnce === true;
+        entry.state = "ACKED";
+        entry.ackedAt = Date.now();
+        entry.joinedOnce = true;
+        this.topicState.set(slug, entry);
         if (!this.subscriptionActive) this.onGlobalSubscriptionReady();
+        // Socket-level readiness already fired onTopicJoined for every
+        // tracked slug via onGlobalSubscriptionReady; this covers the case
+        // this specific topic is joining/rejoining AFTER that already ran
+        // (late ACK, scoped rejoin) so its own gate still opens.
+        else if (!wasJoined) {
+          try { this.onTopicJoined(slug, entry.ackedAt); } catch (error) { this.recordHandlerError(error, "topic joined hook"); }
+        }
       } else {
         this.stats.joinRefused++;
         this.refusedTopics.add(slug);
+        const entry = this.topicState.get(slug) || {};
+        entry.state = "REFUSED";
+        this.topicState.set(slug, entry);
         this.lastError = safeText(JSON.stringify(frame[4] && frame[4].response || { status }));
         logger.stream(`[STREAM] topic ${safeText(slug, 80)} refused${this.label} status=${safeText(status, 32)} detail=${this.lastError}`);
         try { this.onTopicUnavailable(slug, Date.now(), "topic-join-refused"); } catch (error) { this.recordHandlerError(error, "topic refused hook"); }
@@ -455,6 +552,7 @@ class OpenSeaStream {
     }
     this.stats.matchedEvents++;
     this.recordRecent(true);
+    this.lastEventAtBySlug.set(slug, Date.now()); // diagnostics only, see field comment
     const correlationId = `s${process.pid}-${++this.eventSequence}`;
     const decoded = decodeEvent({ event: eventName, topic: "collection:*", payload: event });
     // Per-event trace rows are written by the engine only for events that touch
@@ -500,8 +598,16 @@ class OpenSeaStream {
   healthForCollection(slug) {
     const key = String(slug || "").trim().toLowerCase();
     if (!key || !this.trackedSlugs.has(key)) return "DISCONNECTED";
-    if (this.refusedTopics.has(key)) return "RECONNECTING";
-    return this.health();
+    const shard = this.health();
+    if (shard === "FAILED" || shard === "DISCONNECTED") return shard;
+    if (!this.perCollection) return shard; // global mode: one topic, shard IS the topic
+    const entry = this.topicState.get(key);
+    // Not ACKED yet (still JOINING / REFUSED / never subscribed) is NOT the
+    // same as "socket down": the shard can be fully HEALTHY while this ONE
+    // topic is not actually joined -- report it RECONNECTING on its own,
+    // independent of every other topic (the whole point of this map).
+    if (!entry || entry.state !== "ACKED") return "RECONNECTING";
+    return shard; // its own ACK is in; defer to real socket/heartbeat state
   }
 
   revalidate(why = "revalidate") {
@@ -549,6 +655,12 @@ class OpenSeaStream {
     this.orderBlind = false;
     clearInterval(this.orderBlindTimer);
     this.orderBlindTimer = null;
+    // New generation, new socket: every topic must prove its OWN ACK again.
+    // A stale ACKED entry surviving a reconnect would make healthForCollection
+    // report a topic healthy before its real rejoin reply has arrived.
+    for (const timer of this.topicJoinTimers.values()) clearTimeout(timer);
+    this.topicJoinTimers.clear();
+    this.topicState.clear();
     if (unsubscribe) { try { unsubscribe(); } catch {} }
     if (client) { try { client.disconnect(() => {}); } catch {} }
   }
@@ -561,6 +673,8 @@ class OpenSeaStream {
     this.stopClient();
     this.collections.clear();
     this.trackedSlugs.clear();
+    this.lastEventAtBySlug.clear();
+    this.refusedTopics.clear();
   }
 
   status() {
@@ -575,9 +689,21 @@ class OpenSeaStream {
       }
     }
     const socketConnected = Boolean(this.activeSocket && this.activeSocket.readyState === this.WebSocket.OPEN);
+    // Bounded per-topic snapshot (1.25.35): counts always, slugs capped at 10
+    // so a large tracked set can never flood the renderer/disk (AGENTS.md §22).
+    let topicJoining = 0, topicAcked = 0, topicRefused = 0;
+    const notAckedSample = [];
+    for (const [slug, entry] of this.topicState) {
+      if (entry.state === "ACKED") topicAcked++;
+      else {
+        if (entry.state === "JOINING") topicJoining++; else topicRefused++;
+        if (notAckedSample.length < 10) notAckedSample.push(`${slug}:${entry.state}`);
+      }
+    }
     return {
       mode: this.perCollection ? "official-collections" : "official-global",
       refusedTopics: this.refusedTopics.size,
+      topicJoining, topicAcked, topicRefused, topicNotAckedSample: notAckedSample,
       connected: socketConnected,
       socketConnected,
       subscriptionsActive: this.subscriptionActive,
