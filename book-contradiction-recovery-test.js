@@ -294,6 +294,72 @@ await check("bounded: giving up on retries still consumes a coalesced contradict
   assert.ok((engine.stats.bookContradictionProbes || 0) > before, "give-up must still attempt one coalesced reread rather than losing the evidence entirely");
 });
 
+// ---- Case 11: SCALE -- 146+ NFTs across many busy collections, some contradicting concurrently.
+// Must stay per-NFT single-flight/bounded, never REST-poll untouched NFTs, and P0 (apply/evaluate
+// for the hot Stream->Decision->POST path) must not slow down while P2 recovery reads are in flight. ----
+await check("scale: 146+ NFTs across busy collections, concurrent contradictions -- bounded recovery, P0 latency unaffected", async () => {
+  const TOTAL = 150;
+  const rowsSpec = [];
+  for (let i = 0; i < TOTAL; i++) {
+    rowsSpec.push({ tokenId: String(10000 + i), slug: `busy-coll-${i % 8}` });
+  }
+  const { engine, rows, resolvers } = buildEngine({ rows: rowsSpec });
+  const t0 = Date.now();
+
+  // Seed every NFT with a baseline, then contradict a THIRD of them (50) at
+  // once -- a realistic "busy collection" burst, not an isolated single-NFT
+  // case like Case 1/5. Each uses its OWN distinct hash (per-NFT single-flight
+  // must not conflate them into one shared queue slot).
+  for (const r of rows) {
+    engine.apply(bidEvent({ slug: r.row.collectionSlug, tokenId: r.row.tokenId, maker: RIVAL, price: 0.02, orderHash: `0xbase-${r.row.tokenId}`, eventTimestamp: t0 + 2000 }));
+  }
+  await flush();
+
+  const contradicted = rows.filter((_, i) => i % 3 === 0); // 50 of 150
+  for (const r of contradicted) {
+    engine.apply(bidEvent({ slug: r.row.collectionSlug, tokenId: r.row.tokenId, maker: RIVAL, price: 0.09, orderHash: `0xbase-${r.row.tokenId}`, eventTimestamp: t0 + 500 }));
+  }
+  await flush();
+
+  // Bounded: this goes through the SAME shared RecoveryPlane as every other
+  // background read (workers=6, readsPerSecond=4 token bucket -- existing,
+  // frozen, working design, not something this patch touches). A burst of
+  // 50 contradictions must NOT storm 50 concurrent reads; the plane admits
+  // at most `workers` at once and queues the rest -- but must queue them
+  // (bounded backlog), never silently drop them.
+  const census = engine.recovery.census();
+  assert.ok(resolvers.length >= 1 && resolvers.length <= engine.recovery.workers,
+    `expected the recovery plane to admit a bounded number (<= ${engine.recovery.workers}) of the 50 contradictions at once, got ${resolvers.length} dispatched`);
+  assert.equal(census.dropped, 0, "no contradiction evidence must be silently dropped -- the rest must be queued, not lost");
+  assert.equal(census.queued + resolvers.length, contradicted.length,
+    `every contradicted NFT must be accounted for: either dispatched now (${resolvers.length}) or safely queued (${census.queued}), total must equal ${contradicted.length}`);
+
+  // P0 hot path: a real, unrelated Stream event for an UNTOUCHED NFT, measured
+  // while dozens of P2 recovery reads are queued/in flight, must still apply fast.
+  const untouched = rows[1]; // index 1 is never in the %3===0 contradicted set
+  const p0Start = Date.now();
+  engine.apply(bidEvent({ slug: untouched.row.collectionSlug, tokenId: untouched.row.tokenId, maker: RIVAL, price: 0.5, orderHash: `0xp0-${untouched.row.tokenId}` }));
+  const p0ElapsedMs = Date.now() - p0Start;
+  assert.ok(p0ElapsedMs < 50, `P0 apply() for an unrelated NFT took ${p0ElapsedMs}ms with dozens of P2 recovery reads outstanding -- must stay fast`);
+  assert.equal(untouched.book.effectiveBest(Date.now()).price, 0.5, "the unrelated NFT's real event must still apply correctly");
+
+  // Resolve whatever was actually dispatched now and confirm each settles to
+  // its own real price with no cross-NFT bleed (per-NFT single-flight holds
+  // at scale, not just in the 1-2-NFT cases above).
+  const dispatchedCount = resolvers.length;
+  for (let i = 0; i < dispatchedCount; i++) {
+    const r = contradicted[i];
+    resolvers[i]({ orderHash: `0xbase-${r.row.tokenId}`, price: 0.09, orders: [
+      { orderHash: `0xbase-${r.row.tokenId}`, price: 0.09, maker: RIVAL, kind: "item", endTime: 0, quantity: 1 }
+    ] });
+  }
+  await flush();
+  for (let i = 0; i < dispatchedCount; i++) {
+    const r = contradicted[i];
+    assert.equal(r.book.effectiveBest(Date.now()).price, 0.09, `NFT #${r.row.tokenId} must resolve to its own real price, not bleed from another NFT's recovery`);
+  }
+});
+
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
 process.exitCode = failed ? 1 : 0;
 

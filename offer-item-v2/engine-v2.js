@@ -3158,7 +3158,26 @@ class OfferItemEngineV2 {
          *   này chạy thì đây là giảm thiểu rủi ro race tối đa có thể làm ở
          *   nhánh đã bị thay, không phải một khoá tuyệt đối.
          */
-        if (!(error && error.notSent === true) && bookNow) bookNow.ownUnknownAt = Date.now();
+        if (error && error.notSent === true) {
+          // CHẮC CHẮN CHƯA GỬI: không có gì mơ hồ để đối soát, không terminal
+          // trace (không khác gì chưa từng gửi), own giữ nguyên.
+          return;
+        }
+        // MƠ HỒ (có thể đã tới server) TRÊN LƯỢT ĐÃ BỊ THAY: audit yêu cầu
+        // `http_start` luôn có một terminal trace rõ ràng, dù lượt này không
+        // còn được phép tự thử lại/POST lại (lượt thay thế đã cầm Intent/
+        // Flight và sẽ tự đối soát qua `ownAuthoritative()` nhờ `ownUnknownAt`
+        // vừa đánh dấu). Ghi terminal "AMBIGUOUS_OUTCOME" rồi xin một lượt đọc
+        // đối soát có mục tiêu (an toàn: `queueRead` tự khử trùng theo key,
+        // không tạo lượt đọc thứ hai nếu lượt thay thế đã đang xin).
+        if (bookNow) bookNow.ownUnknownAt = Date.now();
+        const msg = String(error && error.message || error).slice(0, 120);
+        productionTrace.record("submit_failure", { correlationId: first.correlationId || traceId }, {
+          chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+          status: "AMBIGUOUS_OUTCOME", reason: "superseded-ambiguous", target
+        });
+        this.log(`[SEND] SUBMIT AMBIGUOUS (superseded) NFT #${row.tokenId} ${msg} — lượt thay thế sẽ đối soát trước khi gửi`);
+        this.queueRead(row, { reason: "post-uncertain", authoritative: false, readAt: Date.now(), firstRead: false, attempt: 1 });
         return;
       }
       if (this.quota) {

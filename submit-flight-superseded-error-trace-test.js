@@ -33,6 +33,7 @@
 const assert = require("node:assert/strict");
 const { OfferItemEngineV2, STATE } = require("./offer-item-v2/engine-v2");
 const devRuntime = require("./dev-runtime");
+const productionTrace = require("./production-trace");
 
 let passed = 0, failed = 0;
 async function check(name, fn) {
@@ -142,6 +143,47 @@ await check("definitely-not-sent error on a superseded flight does not mark ownU
   await new Promise(r => setImmediate(r));
   await new Promise(r => setImmediate(r));
   assert.ok(!book.ownUnknownAt, "a request that definitely never left the machine needs no reconciliation");
+});
+
+// ---- Case 3 (audit #2): an ambiguous POST error on a SUPERSEDED flight must leave a terminal trace ----
+// `http_start` is always recorded for a real POST attempt (see submitOne's onStage hook). Previously the
+// `!alive()` branch returned with ZERO trace of any kind on an ambiguous error -- http_start got no
+// terminal partner at all, unlike the sibling (still-alive) ambiguous branch which records submit_failure.
+await check("ambiguous POST error on a SUPERSEDED flight still records a terminal trace (AMBIGUOUS_OUTCOME), not silence", async () => {
+  let releaseRequest;
+  const realRecord = productionTrace.record;
+  const recorded = [];
+  productionTrace.record = (stage, event, detail) => { recorded.push({ stage, event, detail }); };
+  try {
+    const { engine, key, book } = buildEngine({
+      tokenId: "9001", slug: "coll",
+      httpImpl: ({ onStage }) => new Promise((resolve, reject) => {
+        releaseRequest = () => { onStage("http_started"); reject(Object.assign(new Error("socket hang up"), { notSent: false })); };
+      })
+    });
+    engine.apply({
+      collectionSlug: "coll", nft: { chain: "ethereum", contract: CONTRACT, tokenId: "9001" },
+      kind: "item", orderHash: "0xrival9001", maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
+      eventTimestamp: Date.now(), receivedAt: Date.now(), hasOrderData: true,
+      event: "item_received_bid", pricePerItem: 0.03
+    });
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+    engine.flights.set(key, { id: 999999, controller: new AbortController() });
+    releaseRequest();
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+
+    const httpStart = recorded.find(r => r.stage === "http_start");
+    assert.ok(httpStart, "sanity: http_start must have been recorded");
+    const terminal = recorded.find(r => r.stage !== "http_start" &&
+      ((r.detail && (r.detail.status === "AMBIGUOUS_OUTCOME" || r.detail.status === "SUCCESS" || r.detail.status === "FAILED"))));
+    assert.ok(terminal, "every http_start must be followed by a terminal trace (SUCCESS / FAILED / AMBIGUOUS_OUTCOME), never silence on a superseded flight's ambiguous error");
+    assert.equal(terminal.detail.status, "AMBIGUOUS_OUTCOME", "an ambiguous (possibly-delivered) error on a superseded flight must terminate as AMBIGUOUS_OUTCOME, not be misreported as a clean FAILED/SUCCESS");
+    assert.ok(book.ownUnknownAt > 0, "ownUnknownAt must still be marked so the replacement flight reconciles");
+  } finally {
+    productionTrace.record = realRecord;
+  }
 });
 
 devRuntime.spendAllowed = realSpendAllowed;

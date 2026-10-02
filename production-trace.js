@@ -13,8 +13,12 @@ const REASONS = new Set(["SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET
   // "mapped nhưng không áp" -- phân loại chính xác lý do apply() từ chối (audit:
   // stream_rx ghi "mapped" mà book_update không bao giờ viết ra, không ai biết
   // tại sao). Xem memory-book.js diagnoseApply() và engine-v2.js's book_update.
-  "stale", "version-stale", "tombstoned", "trait-no-match", "trait-unknown", "expired", "duplicate", "no-op"]);
-const STATUSES = new Set(["mapped", "scope-event", "decode-failed", "applied", "not-applied", "covered", "uncovered", "SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "READY", "WAITING", "QUEUED", "POST", "SUCCESS", "FAILED"]);
+  "stale", "version-stale", "tombstoned", "trait-no-match", "trait-unknown", "expired", "duplicate", "no-op",
+  // POST bị supersede/abort trong lúc bay (audit: "!alive()" catch branch) --
+  // mơ hồ, có thể đã tới server, không được gửi lại mù. Xem engine-v2.js's
+  // submitOne catch(error) !alive() branch.
+  "superseded-ambiguous"]);
+const STATUSES = new Set(["mapped", "scope-event", "decode-failed", "applied", "not-applied", "covered", "uncovered", "SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "READY", "WAITING", "QUEUED", "POST", "SUCCESS", "FAILED", "AMBIGUOUS_OUTCOME"]);
 // Which independent Stream connection delivered this event (1.25.40 dual-feed
 // redundancy). Lets a production trace distinguish "feed A never got this"
 // from "feed A got it, feed B also got it" from raw stream_rx rows alone.

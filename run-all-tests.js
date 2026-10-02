@@ -11,6 +11,7 @@ const suites = [
   { file: "two-key-capacity-independence-test.js" },
   { file: "book-contradiction-recovery-test.js" },
   { file: "submit-flight-superseded-error-trace-test.js" },
+  { file: "production-trace-superseded-ambiguous-test.js" },
   { file: "opensea-criteria-test.js" },
   { file: "offer-item-v2-recovery-lifecycle-test.js" },
   { file: "offer-item-v2-topic-recovery-test.js" },
