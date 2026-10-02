@@ -3257,6 +3257,17 @@ class OfferItemEngineV2 {
         // A wallet switch happened while this POST flew: the order is the OLD
         // wallet's and must never become the new wallet's Mine (1.25.12).
         if (this.epoch !== submitEpoch) {
+          // HTTP 2xx thật (http_start đã ghi) nhưng bị bỏ qua vì đổi ví giữa
+          // lúc bay -- vẫn phải có một terminal, không được im lặng (cùng
+          // audit "mọi http_start chỉ đúng một terminal" như hai nhánh lỗi
+          // phía trên). KHÔNG dùng status "SUCCESS" ở đây: order đó không
+          // phải một offer thành công của ví/epoch HIỆN TẠI -- lẫn vào SUCCESS
+          // sẽ làm audit đếm nhầm. Status riêng, loại hẳn khỏi số liệu thành
+          // công thật.
+          productionTrace.record("submit_success", { correlationId: first.correlationId || traceId }, {
+            chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+            status: "SUCCESS_DISCARDED_OLD_EPOCH", reason: "other", mine: target, max: row.maxPrice, target
+          });
           this.log(`[SEND] SUBMIT SUCCESS NFT #${row.tokenId} của ví cũ trả về sau khi đổi ví — bỏ qua, không ghi vào ví mới`);
           return;
         }

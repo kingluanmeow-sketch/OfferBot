@@ -22,7 +22,13 @@ const REASONS = new Set(["SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET
   // flushed=false && firstByteAt=0) -- CHẮC CHẮN CHƯA GỬI, terminal riêng
   // biệt với "http" chung, để phân biệt rõ với mơ hồ/đã gửi.
   "not-sent"]);
-const STATUSES = new Set(["mapped", "scope-event", "decode-failed", "applied", "not-applied", "covered", "uncovered", "SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "READY", "WAITING", "QUEUED", "POST", "SUCCESS", "FAILED", "AMBIGUOUS_OUTCOME", "DEFINITELY_NOT_SENT"]);
+const STATUSES = new Set(["mapped", "scope-event", "decode-failed", "applied", "not-applied", "covered", "uncovered", "SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "READY", "WAITING", "QUEUED", "POST", "SUCCESS", "FAILED", "AMBIGUOUS_OUTCOME", "DEFINITELY_NOT_SENT",
+  // HTTP 2xx thật nhưng về SAU khi ví đã đổi (epoch khác submitEpoch) -- order
+  // đó CÓ tồn tại trên OpenSea, nhưng KHÔNG được tính là offer thành công cho
+  // ví/epoch hiện tại (audit: không được đếm nhầm là SUCCESS runtime hiện tại
+  // đã nhận order). Tách khỏi "SUCCESS" để không lẫn vào số liệu thành công
+  // thật của ví đang chạy.
+  "SUCCESS_DISCARDED_OLD_EPOCH"]);
 // Which independent Stream connection delivered this event (1.25.40 dual-feed
 // redundancy). Lets a production trace distinguish "feed A never got this"
 // from "feed A got it, feed B also got it" from raw stream_rx rows alone.

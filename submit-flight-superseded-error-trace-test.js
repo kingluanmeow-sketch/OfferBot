@@ -276,6 +276,44 @@ await check("http_start -> notSent while the flight is still alive terminates as
   }
 });
 
+// ---- Case 6: http_start -> HTTP 2xx arriving AFTER a wallet switch (epoch changed mid-flight)
+// must still record a terminal trace, not silently discard ----
+await check("http_start -> 2xx success arriving after a wallet switch mid-flight records SUCCESS_DISCARDED_OLD_EPOCH, not plain SUCCESS, not silence", async () => {
+  let resolveRequest;
+  const realRecord = productionTrace.record;
+  const recorded = [];
+  productionTrace.record = (stage, event, detail) => { recorded.push({ stage, event, detail }); };
+  try {
+    const { engine, key, book } = buildEngine({
+      tokenId: "9004", slug: "coll",
+      httpImpl: ({ onStage }) => new Promise(resolve => {
+        resolveRequest = () => { onStage("http_started"); resolve({ status: 200, headers: {}, body: { order_hash: "0xold-wallet-order" } }); };
+      })
+    });
+    engine.apply({
+      collectionSlug: "coll", nft: { chain: "ethereum", contract: CONTRACT, tokenId: "9004" },
+      kind: "item", orderHash: "0xrival9004", maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
+      eventTimestamp: Date.now(), receivedAt: Date.now(), hasOrderData: true,
+      event: "item_received_bid", pricePerItem: 0.06
+    });
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+    // Simulate a wallet switch (bumps engine.epoch) while this POST is still in flight.
+    engine.flights.set(key, { id: 999999, controller: new AbortController() }); // superseded too, for the real-world shape
+    engine.epoch++;
+    resolveRequest();
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+
+    const terminal = recorded.find(r => r.stage === "submit_success" || r.stage === "submit_failure");
+    assert.ok(terminal, "a 2xx HTTP response after a wallet switch must still record a terminal trace, never silence");
+    assert.equal(terminal.detail.status, "SUCCESS_DISCARDED_OLD_EPOCH", "the HTTP response was genuinely 2xx but belongs to a superseded wallet/epoch -- must NOT be counted as a real SUCCESS for the current wallet, and must not be silent either");
+    assert.notEqual(terminal.detail.status, "SUCCESS", "a discarded-old-epoch order must never be misclassified as a real current-wallet SUCCESS");
+  } finally {
+    productionTrace.record = realRecord;
+  }
+});
+
 devRuntime.spendAllowed = realSpendAllowed;
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
 process.exitCode = failed ? 1 : 0;
