@@ -186,6 +186,96 @@ await check("ambiguous POST error on a SUPERSEDED flight still records a termina
   }
 });
 
+// ---- Case 4: http_start -> notSent on a SUPERSEDED flight must still terminate (DEFINITELY_NOT_SENT), not be silent ----
+// PROVEN via submitter.js source: stage("http_started") fires unconditionally BEFORE `req` is even
+// constructed (line ~121, well before https.request()); `notSent = !flushed && !firstByteAt` and `flushed`
+// only becomes true on req.on("finish") AFTER req.write()/req.end() (line ~184). So a DNS failure, refused
+// connection, or a synchronous throw while building the request (caught at line ~159) all land with
+// notSent===true STRICTLY AFTER http_started was already recorded. This is the ordinary, common shape of
+// a notSent error, not an edge case -- the invariant does NOT hold that notSent cannot follow http_started.
+await check("http_start -> notSent on a SUPERSEDED flight still records a terminal trace (DEFINITELY_NOT_SENT), no blind reconcile/retry, no duplicate", async () => {
+  let releaseRequest;
+  const realRecord = productionTrace.record;
+  const recorded = [];
+  productionTrace.record = (stage, event, detail) => { recorded.push({ stage, event, detail }); };
+  try {
+    const { engine, key, book } = buildEngine({
+      tokenId: "9002", slug: "coll",
+      httpImpl: ({ onStage }) => new Promise((resolve, reject) => {
+        releaseRequest = () => { onStage("http_started"); reject(Object.assign(new Error("ENOTFOUND api.opensea.io"), { notSent: true })); };
+      })
+    });
+    engine.apply({
+      collectionSlug: "coll", nft: { chain: "ethereum", contract: CONTRACT, tokenId: "9002" },
+      kind: "item", orderHash: "0xrival9002", maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
+      eventTimestamp: Date.now(), receivedAt: Date.now(), hasOrderData: true,
+      event: "item_received_bid", pricePerItem: 0.04
+    });
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+    // Supersede the flight BEFORE the DNS failure comes back -- same race as
+    // the ambiguous case, but this time the error is DEFINITELY_NOT_SENT.
+    engine.flights.set(key, { id: 999999, controller: new AbortController() });
+    releaseRequest();
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+
+    const httpStart = recorded.find(r => r.stage === "http_start");
+    assert.ok(httpStart, "sanity: http_start must have been recorded");
+    const terminal = recorded.find(r => r.stage === "submit_success" || r.stage === "submit_failure");
+    assert.ok(terminal, "http_start must never be followed by silence, even for a definitely-not-sent error on a superseded flight");
+    assert.equal(terminal.detail.status, "DEFINITELY_NOT_SENT", "a definitely-not-sent error must terminate as DEFINITELY_NOT_SENT, not AMBIGUOUS_OUTCOME (nothing to reconcile) and not silence");
+    assert.ok(!book.ownUnknownAt, "a request that definitely never left the machine needs no reconciliation -- ownUnknownAt must stay clear");
+    // No blind retry/reconcile read was queued for this definitely-not-sent, superseded flight.
+    assert.ok(!engine.pendingReads.has(key) || engine.pendingReads.get(key)?.reason !== "post-uncertain",
+      "a definitely-not-sent error must not queue a targeted reconcile read -- there is nothing ambiguous to reconcile");
+  } finally {
+    productionTrace.record = realRecord;
+  }
+});
+
+// ---- Case 5: http_start -> notSent while STILL alive (not superseded) must also terminate cleanly,
+// with the existing fast-retry path, and must not duplicate-POST or mark ownUnknownAt ----
+await check("http_start -> notSent while the flight is still alive terminates as DEFINITELY_NOT_SENT, schedules exactly one fast retry, no duplicate POST, no reconcile", async () => {
+  let releaseRequest;
+  const realRecord = productionTrace.record;
+  const recorded = [];
+  productionTrace.record = (stage, event, detail) => { recorded.push({ stage, event, detail }); };
+  const realScheduleRetry = OfferItemEngineV2.prototype.scheduleRetry;
+  const retries = [];
+  OfferItemEngineV2.prototype.scheduleRetry = function (...args) { retries.push(args); };
+  try {
+    const { engine, key, book } = buildEngine({
+      tokenId: "9003", slug: "coll",
+      httpImpl: ({ onStage }) => new Promise((resolve, reject) => {
+        releaseRequest = () => { onStage("http_started"); reject(Object.assign(new Error("connect ECONNREFUSED"), { notSent: true })); };
+      })
+    });
+    engine.apply({
+      collectionSlug: "coll", nft: { chain: "ethereum", contract: CONTRACT, tokenId: "9003" },
+      kind: "item", orderHash: "0xrival9003", maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
+      eventTimestamp: Date.now(), receivedAt: Date.now(), hasOrderData: true,
+      event: "item_received_bid", pricePerItem: 0.05
+    });
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+    // Flight is NOT superseded this time -- genuinely still alive.
+    releaseRequest();
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+
+    const terminal = recorded.find(r => r.stage === "submit_success" || r.stage === "submit_failure");
+    assert.ok(terminal, "http_start must have a terminal trace on the still-alive notSent path too");
+    assert.equal(terminal.detail.status, "DEFINITELY_NOT_SENT");
+    assert.ok(!book.ownUnknownAt, "definitely-not-sent needs no reconciliation even on the still-alive path");
+    assert.equal(retries.length, 1, "exactly one fast retry must be scheduled -- no duplicate POST attempts stacked");
+    assert.equal(retries[0][3], "not-sent", "the retry must be tagged not-sent, matching the terminal classification");
+  } finally {
+    productionTrace.record = realRecord;
+    OfferItemEngineV2.prototype.scheduleRetry = realScheduleRetry;
+  }
+});
+
 devRuntime.spendAllowed = realSpendAllowed;
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
 process.exitCode = failed ? 1 : 0;

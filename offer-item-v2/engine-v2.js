@@ -3159,8 +3159,18 @@ class OfferItemEngineV2 {
          *   nhánh đã bị thay, không phải một khoá tuyệt đối.
          */
         if (error && error.notSent === true) {
-          // CHẮC CHẮN CHƯA GỬI: không có gì mơ hồ để đối soát, không terminal
-          // trace (không khác gì chưa từng gửi), own giữ nguyên.
+          // CHẮC CHẮN CHƯA GỬI: own giữ nguyên (không có gì để đối soát), KHÔNG
+          // reconcile/retry mù. Nhưng `http_started` đã ghi (HttpPool bắn stage
+          // này ngay khi bắt đầu dựng request, TRƯỚC khi req được tạo -- xem
+          // submitter.js -- nên notSent, một lỗi xảy ra TRƯỚC khi body rời máy
+          // trọn vẹn, HOÀN TOÀN có thể đến sau http_started về mặt kiến trúc,
+          // không phải trường hợp không thể có) -- vẫn cần MỘT terminal trace
+          // riêng biệt, không lẫn với AMBIGUOUS_OUTCOME, để http_start không
+          // bao giờ im lặng tuyệt đối.
+          productionTrace.record("submit_failure", { correlationId: first.correlationId || traceId }, {
+            chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+            status: "DEFINITELY_NOT_SENT", reason: "not-sent", target
+          });
           return;
         }
         // MƠ HỒ (có thể đã tới server) TRÊN LƯỢT ĐÃ BỊ THAY: audit yêu cầu
@@ -3186,26 +3196,32 @@ class OfferItemEngineV2 {
       const msg = String(error && error.message || error).slice(0, 120);
       this.metrics.get(traceId)?.fail("http");
       this.metrics.finish(traceId);
-      productionTrace.record("submit_failure", { correlationId: first.correlationId || traceId }, {
-        chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
-        status: "FAILED", reason: "http", target
-      });
       /**
        * CHẮC CHẮN CHƯA GỬI vs CÓ THỂ ĐÃ TỚI SERVER
        *
        *   HttpPool đánh dấu `notSent` khi body chưa rời máy trọn vẹn (lỗi
        *   DNS/kết nối/huỷ trước khi ghi xong). Khi đó không thể có order nào
-       *   ở server: thử lại nhanh. Ngược lại (timeout sau khi đã gửi, socket
-       *   rớt giữa chừng) thì order CÓ THỂ đã được nhận: không gửi lại mù —
-       *   đánh dấu own của RIÊNG hàng này là mơ hồ; lượt thử lại sẽ chờ một
-       *   lượt đọc đối soát đúng token đó trước khi dựng order mới.
+       *   ở server: thử lại nhanh, terminal trace riêng (DEFINITELY_NOT_SENT,
+       *   không lẫn với mơ hồ). Ngược lại (timeout sau khi đã gửi, socket rớt
+       *   giữa chừng) thì order CÓ THỂ đã được nhận: không gửi lại mù — đánh
+       *   dấu own của RIÊNG hàng này là mơ hồ (AMBIGUOUS_OUTCOME); lượt thử
+       *   lại sẽ chờ một lượt đọc đối soát đúng token đó trước khi dựng order
+       *   mới.
        */
       if (error && error.notSent === true) {
+        productionTrace.record("submit_failure", { correlationId: first.correlationId || traceId }, {
+          chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+          status: "DEFINITELY_NOT_SENT", reason: "not-sent", target
+        });
         this.netStat("notSent", 1);
         this.log(`[SEND] SUBMIT NOT SENT NFT #${row.tokenId} ${msg} — thử lại nhanh`);
         this.scheduleRetry(key, 0, msg, "not-sent");
         return;
       }
+      productionTrace.record("submit_failure", { correlationId: first.correlationId || traceId }, {
+        chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+        status: "AMBIGUOUS_OUTCOME", reason: "http", target
+      });
       if (bookNow) bookNow.ownUnknownAt = Date.now();
       this.netStat("ambiguous", 1);
       this.log(`[SEND] SUBMIT AMBIGUOUS NFT #${row.tokenId} ${msg} — đối soát token trước khi gửi lại`);

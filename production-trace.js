@@ -17,8 +17,12 @@ const REASONS = new Set(["SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET
   // POST bị supersede/abort trong lúc bay (audit: "!alive()" catch branch) --
   // mơ hồ, có thể đã tới server, không được gửi lại mù. Xem engine-v2.js's
   // submitOne catch(error) !alive() branch.
-  "superseded-ambiguous"]);
-const STATUSES = new Set(["mapped", "scope-event", "decode-failed", "applied", "not-applied", "covered", "uncovered", "SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "READY", "WAITING", "QUEUED", "POST", "SUCCESS", "FAILED", "AMBIGUOUS_OUTCOME"]);
+  "superseded-ambiguous",
+  // HttpPool đánh dấu notSent khi body chưa rời máy trọn vẹn (submitter.js:
+  // flushed=false && firstByteAt=0) -- CHẮC CHẮN CHƯA GỬI, terminal riêng
+  // biệt với "http" chung, để phân biệt rõ với mơ hồ/đã gửi.
+  "not-sent"]);
+const STATUSES = new Set(["mapped", "scope-event", "decode-failed", "applied", "not-applied", "covered", "uncovered", "SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "READY", "WAITING", "QUEUED", "POST", "SUCCESS", "FAILED", "AMBIGUOUS_OUTCOME", "DEFINITELY_NOT_SENT"]);
 // Which independent Stream connection delivered this event (1.25.40 dual-feed
 // redundancy). Lets a production trace distinguish "feed A never got this"
 // from "feed A got it, feed B also got it" from raw stream_rx rows alone.
