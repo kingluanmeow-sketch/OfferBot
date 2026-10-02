@@ -464,6 +464,16 @@ class OfferItemEngineV2 {
      * thành công hoặc bỏ cuộc) cho `stats.traitScopeRecoveryMs`.
      */
     this.traitScopeRetry = new Map();
+    /**
+     * tokenKey -> true: một book-contradiction thật đã xuất hiện trong lúc
+     * CHUNG cooldown `traitProbedAt` (chia sẻ với trait-scope) đang bận, hoặc
+     * lúc key đang có một lượt trait-scope khác bay (`hydrating`) -- KHÔNG
+     * được bỏ qua im lặng (audit sửa lần 2). Coalesce latest-wins: chỉ cần
+     * BIẾT có mâu thuẫn đang chờ, không cần giữ giá/hash cụ thể (lượt đọc
+     * bắn lại sẽ tự lấy trạng thái sổ mới nhất). `maybeRequeueBookContradiction`
+     * tiêu thụ đúng MỘT lần khi lượt trait-scope hiện tại settle/bỏ cuộc.
+     */
+    this.pendingContradiction = new Set();
 
     /**
      * NHỊP DỌN LỆNH HẾT HẠN — đồng hồ local, không cần mạng.
@@ -1511,6 +1521,7 @@ class OfferItemEngineV2 {
     // chỉ trông cậy generation-check lúc bắn, vì Reset đã dọn book/row rồi.
     for (const state of this.traitScopeRetry.values()) if (state.timer) clearTimeout(state.timer);
     this.traitScopeRetry.clear();
+    this.pendingContradiction.clear();
     this.traits.retain([...this.rows.keys()]);
     this.balanceProbedAt = 0;
     this.balanceResultAt = 0;
@@ -1647,6 +1658,7 @@ class OfferItemEngineV2 {
     const tsr = this.traitScopeRetry.get(key);
     if (tsr && tsr.timer) clearTimeout(tsr.timer);
     this.traitScopeRetry.delete(key);
+    this.pendingContradiction.delete(key);
     const ts = this.templateState.get(key);
     if (ts && ts.timer) clearTimeout(ts.timer);
     this.templateState.delete(key);
@@ -1959,6 +1971,65 @@ class OfferItemEngineV2 {
           tokenId: row.tokenId, affected: 0, status: "not-applied", reason,
           orderHash: op.orderHash || "", price: op.price, kind: op.kind
         });
+        /**
+         * BOOK CONTRADICTION: ĐÃ VỪA BỎ MỘT BẰNG CHỨNG LẼ RA PHẢI NÂNG BEST
+         * (audit "shadow": 5/6 NFT có effectiveBest nội bộ thấp hơn thật so
+         * với `/best` của OpenSea)
+         *
+         *   `reason === "stale"` nghĩa là `apply()` coi op này cũ hơn/trùng
+         *   một seq đã thấy cho CHÍNH orderHash đó -- bình thường đây là
+         *   benign (một lượt feed B replay chậm của cái feed A đã xử lý).
+         *   NHƯNG nếu giá của op bị bỏ lại CAO HƠN effectiveBest hiện tại
+         *   của token, "cũ hơn theo seq nội bộ" không còn là bằng chứng vô
+         *   hại nữa -- nó là MÂU THUẪN THẬT: sổ cục bộ đang giữ một giá
+         *   thấp hơn giá mà chính một event ta vừa nhận lại nói là cao hơn.
+         *   OpenSea Stream là best-effort (miss/out-of-order là tài liệu
+         *   chính thức xác nhận, không phải giả thuyết) -- khả năng seq nội
+         *   bộ (dựa trên event_timestamp hoặc receivedAt) không khớp thứ tự
+         *   THẬT của OpenSea là có thật, và REST `/best` (tổng hợp
+         *   item+trait+collection, authority thật) là cách duy nhất xác
+         *   nhận.
+         *
+         *   Tái dùng ĐÚNG cơ chế đã có cho trait-scope (bounded, backoff,
+         *   single-flight per key, generation-safe) -- không tạo đường mới:
+         *   `scheduleTraitScopeRetry`'s discard-retry trong `mergeBest` tự
+         *   lo phần "nếu bị stale-discard lần nữa thì retry có trần", ở đây
+         *   chỉ cần XIN đúng một lượt đọc đầu tiên, có cooldown riêng
+         *   (TRAIT_PROBE_COOLDOWN_MS, Map `traitProbedAt` CÙNG MỘT bộ đếm
+         *   với trait-scope -- một token bận cả hai loại bằng chứng cùng
+         *   lúc không xin hai lượt đọc).
+         */
+        if (reason === "stale" && Number(op.price) > 0 && this.state === STATE.RUNNING &&
+            typeof this.adapter.fetchBest === "function") {
+          const book = this.book.get(key);
+          const current = book ? book.effectiveBest(receivedAt).price : 0;
+          if (op.price > current + 1e-9) {
+            const last = this.traitProbedAt.get(key) || 0;
+            const coolingDown = receivedAt - last < TRAIT_PROBE_COOLDOWN_MS;
+            /**
+             * KHÔNG ĐƯỢC BỎ QUA IM LẶNG KHI CHUNG COOLDOWN ĐANG BẬN (audit 2)
+             *
+             *   `traitProbedAt` là cooldown CHUNG với trait-scope (cố ý --
+             *   một token bận cả hai loại bằng chứng cùng lúc không xin hai
+             *   lượt đọc). Nhưng bản trước: nếu cooldown đang chạy (một
+             *   trait-scope probe VỪA bắn) HOẶC key đang `hydrating` (một
+             *   lượt khác đang bay), mâu thuẫn này bị BỎ QUA HẲN -- không
+             *   coalesce, không hẹn bắn lại, mất luôn bằng chứng. Nay chỉ
+             *   cần ĐÁNH DẤU (`pendingContradiction`, latest-wins, không giữ
+             *   giá/hash cụ thể) -- `maybeRequeueBookContradiction` tiêu thụ
+             *   đúng MỘT lần ngay khi lượt trait-scope hiện tại settle/bỏ
+             *   cuộc (xem `settleTraitScopeRetry`/`scheduleTraitScopeRetry`),
+             *   hữu hạn thật, không timer riêng, không REST mới ngay bây giờ.
+             */
+            if (coolingDown || this.hydrating.has(key)) {
+              this.pendingContradiction.add(key);
+            } else {
+              this.traitProbedAt.set(key, receivedAt);
+              this.stats.bookContradictionProbes = (this.stats.bookContradictionProbes || 0) + 1;
+              this.queueRead(row, { reason: "trait-scope", authoritative: true, readAt: receivedAt, firstRead: false, attempt: 1 });
+            }
+          }
+        }
       }
     }
     if (op.endTime > 0 && touched.length) this.noteExpiry(op.endTime);
@@ -3059,7 +3130,37 @@ class OfferItemEngineV2 {
       });
     } catch (error) {
       this.lastPostAt = Date.now();
-      if (!alive()) return;
+      if (!alive()) {
+        /**
+         * LƯỢT BỊ THAY ("!alive()") + POST VỪA NÉM LỖI = KHOẢNG TRỐNG THẬT (audit)
+         *
+         *   Trước đây `return` NGAY ở đây -- không submit_failure, không
+         *   submit_success, KHÔNG MỘT dòng trace nào, và quan trọng hơn:
+         *   KHÔNG đánh dấu own mơ hồ. Nhánh SUCCESS (dưới, dòng ~3161) đã tự
+         *   nhận đúng race này ("Watchdog đã thay lượt này trong lúc POST
+         *   bay -- nhưng OpenSea ĐÃ nhận order") và xử lý đúng; nhánh lỗi
+         *   này thì không có gì tương đương. Hậu quả đo được (production
+         *   audit): `http_start` ghi rồi im lặng tuyệt đối, rồi một lượt
+         *   SEND thứ hai cho ĐÚNG NFT đó bắt đầu ~1.3s sau và thành công --
+         *   đúng mẫu hình sẽ xảy ra khi lượt đầu bị abort (watchdog/
+         *   supersede huỷ `flight.controller.signal`) NGAY SAU KHI request
+         *   đã rời máy nhưng TRƯỚC KHI có phản hồi: OpenSea CÓ THỂ đã nhận
+         *   order đó, và lượt thay thế không được gửi mù.
+         *
+         *   `notSent === true` (HttpPool tự đánh dấu khi body chưa rời máy
+         *   trọn vẹn) là trường hợp AN TOÀN duy nhất để bỏ qua im lặng --
+         *   CHẮC CHẮN CHƯA GỬI thì không có gì để đối soát. Mọi lỗi khác
+         *   (timeout, abort sau khi gửi, socket rớt giữa chừng) là MƠ HỒ:
+         *   đánh dấu `ownUnknownAt` NGAY, cùng cơ chế `ownAuthoritative()`
+         *   đã có sẵn -- lượt thay thế (đã cầm Intent/Flight mới) tự kiểm
+         *   own-authority TRƯỚC khi gửi (xem đầu `submitOne`) và sẽ tự đợi
+         *   đối soát nếu nó CHƯA kịp gửi; nếu nó đã gửi xong trước khi dòng
+         *   này chạy thì đây là giảm thiểu rủi ro race tối đa có thể làm ở
+         *   nhánh đã bị thay, không phải một khoá tuyệt đối.
+         */
+        if (!(error && error.notSent === true) && bookNow) bookNow.ownUnknownAt = Date.now();
+        return;
+      }
       if (this.quota) {
         this.quota.report({ domain: quotaDomain, status: 0, latencyMs: 0 });
       }
@@ -4732,6 +4833,7 @@ class OfferItemEngineV2 {
       const row = this.rows.get(key);
       this.log(`[TRAIT-SCOPE] #${row?.tokenId || key} bỏ cuộc sau ${attempts - 1} lượt retry -- ` +
         `collection vẫn bận liên tục; chờ sự kiện trait kế tiếp (cooldown ${TRAIT_PROBE_COOLDOWN_MS}ms) để hỏi lại.`);
+      this.maybeRequeueBookContradiction(key);
       return;
     }
     const generation = this.recovery.generation;
@@ -4766,11 +4868,29 @@ class OfferItemEngineV2 {
    */
   settleTraitScopeRetry(key) {
     const state = this.traitScopeRetry.get(key);
-    if (!state) return;
-    if (state.timer) clearTimeout(state.timer);
-    this.stats.traitScopeRecoveries++;
-    this.stats.traitScopeRecoveryMsTotal += Date.now() - state.firstAt;
-    this.traitScopeRetry.delete(key);
+    if (state) {
+      if (state.timer) clearTimeout(state.timer);
+      this.stats.traitScopeRecoveries++;
+      this.stats.traitScopeRecoveryMsTotal += Date.now() - state.firstAt;
+      this.traitScopeRetry.delete(key);
+    }
+    this.maybeRequeueBookContradiction(key);
+  }
+
+  /**
+   * Tiêu thụ ĐÚNG MỘT LẦN một book-contradiction bị coalesce lúc cooldown/
+   * hydrating đang bận (xem nơi gọi `pendingContradiction.add`). Gọi sau khi
+   * lượt trait-scope hiện tại cho ĐÚNG key này đã settle hay bỏ cuộc hẳn --
+   * không timer riêng, không giữ lại gì nếu row đã dừng/engine đã Reset.
+   */
+  maybeRequeueBookContradiction(key) {
+    if (!this.pendingContradiction.has(key)) return;
+    this.pendingContradiction.delete(key);
+    const row = this.rows.get(key);
+    if (!row || !row.running || this.state !== STATE.RUNNING || typeof this.adapter.fetchBest !== "function") return;
+    this.traitProbedAt.set(key, Date.now());
+    this.stats.bookContradictionProbes = (this.stats.bookContradictionProbes || 0) + 1;
+    this.queueRead(row, { reason: "trait-scope", authoritative: true, readAt: Date.now(), firstRead: false, attempt: 1 });
   }
 
   /**
@@ -5111,12 +5231,55 @@ class OfferItemEngineV2 {
       }
       const group = order.kind === "collection" ? book.collection
         : order.kind === "trait" ? book.trait : book.item;
-      if (group.has(order.orderHash)) continue;
+      /**
+       * ĐỌC AUTHORITATIVE PHẢI SỬA ĐƯỢC MỘT BẢN GHI SAI (audit)
+       *
+       *   Trước đây `if (group.has(hash)) continue;` bỏ qua VÔ ĐIỀU KIỆN khi
+       *   hash đã có trong sổ -- đúng cho lượt đọc NỀN thường (Stream mới
+       *   hơn REST, không ghi đè), nhưng SAI cho đúng lượt đọc authoritative
+       *   mà `scheduleTraitScopeRetry`/book-contradiction CHỦ Ý xin vì nghi
+       *   ngờ bản ghi hiện tại đã sai (bị `apply()` từ chối "stale" trong
+       *   khi mang giá cao hơn). Lượt đọc này đã qua fencing generation/
+       *   streamSeq ở TRÊN (không có Stream nào mới hơn mốc bắt đầu đọc),
+       *   nên tới đây nó an toàn để SỬA một bản ghi cũ -- chỉ khi
+       *   `authoritative` và giá/hạn thực sự khác, không phải ghi đè mù.
+       */
+      if (group.has(order.orderHash)) {
+        if (!authoritative) continue;
+        const existing = group.get(order.orderHash);
+        if (existing.price === Number(order.price) && existing.endTime === (Number(order.endTime) || 0)) continue;
+      }
       group.set(order.orderHash, {
         orderHash: order.orderHash, price: Number(order.price), maker: String(order.maker || "").toLowerCase(),
         kind: order.kind, quantity: Number(order.quantity) || 1, currency: "WETH",
         endTime: Number(order.endTime) || 0, seq: 0, at: now
       });
+      /**
+       * SNAPSHOT AUTHORITY MỚI KHÔNG ĐƯỢC BỊ STREAM REPLAY CŨ GHI ĐÈ (audit)
+       *
+       *   `book.seen` (TokenBook, so seq TRONG scope=orderHash để chặn sự
+       *   kiện cũ -- xem `isStale()`) KHÔNG được cập nhật ở đây trước khi
+       *   sửa. Hậu quả: ngay sau một lượt merge REST authority cho hash H,
+       *   một replay Stream CŨ của ĐÚNG hash H (feed B trễ, hàng đợi dual-
+       *   feed, DLQ) tới với giá/hạn CŨ hơn giá vừa xác nhận -- `isStale()`
+       *   không có gì để so (chưa từng ghi `seen` cho H), nên không chặn,
+       *   và check "duplicate" trong `TokenBook.apply()` so giá/hạn thấy
+       *   KHÁC (vì bản REST mới hơn) nên KHÔNG coi là duplicate -- record
+       *   bị GHI ĐÈ bằng giá cũ, ngay sau khi vừa được REST xác nhận là
+       *   giá thật. Stamp `book.seen` tại mốc BẮT ĐẦU lượt đọc
+       *   (`snapshotStartedAt`), KHÔNG PHẢI `now` lúc merge xong (audit sửa
+       *   lần 2): `now` ở đây là thời điểm HOÀN TẤT round-trip REST, luôn
+       *   TRỄ hơn lúc đọc bắt đầu. Dùng `now` làm watermark sẽ loại nhầm
+       *   một Stream event THẬT, MỚI, tới đúng trong khoảng round-trip đó
+       *   (sau lúc đọc bắt đầu nhưng trước lúc merge xong) -- event đó
+       *   mang thông tin mới hơn cả chính snapshot REST, không phải cũ.
+       *   `snapshotStartedAt` là mốc ĐÚNG: mọi event có seq <= mốc đọc bắt
+       *   đầu chắc chắn cũ hơn snapshot này; event có seq lớn hơn (tới
+       *   trong hoặc sau lúc đọc bay) luôn được coi là mới, kể cả cho
+       *   chính hash H. `Math.max` với giá đã có để không bao giờ HẠ một
+       *   watermark đã cao hơn do một event thật khác đã ghi trước đó.
+       */
+      book.seen.set(order.orderHash, Math.max(book.seen.get(order.orderHash) || 0, snapshotStartedAt));
       book.capGroup(group);
       book.generation++;
     }
