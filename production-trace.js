@@ -14,14 +14,14 @@ const STAGES = new Set(["stream_rx", "stream_mapped", "book_update", "decision",
   // (watchdog abandons a flight still "sending", or a direct HTTP error that
   // cannot prove the server never received the POST). See abandonFlight()/
   // submitOne() in engine-v2.js.
-  "submit_ambiguous", "rest_request", "rest_response", "bootstrap"]);
+  "submit_ambiguous", "own_cancel", "rest_request", "rest_response", "bootstrap"]);
 const REASONS = new Set(["SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "topic-not-ready", "shadow-authority-required", "low-balance", "first-read", "template", "own-state-unknown", "not-applied", "applied", "http", "stale-before-post", "quota", "build", "cancelled", "other",
   // 1.25.42: POST 2xx no longer claims SUCCESS by itself -- these reasons
   // mark the provisional/confirmation lifecycle. See engine-v2.js
   // scheduleOwnConfirmation() and recordOwnOrder().
   "provisional", "confirmed", "unconfirmed",
   // 1.25.44: why a flight was abandoned while still "sending" (ambiguous).
-  "not-sent", "ambiguous", "watchdog", "no-progress"]);
+  "not-sent", "ambiguous", "watchdog", "no-progress", "replaced"]);
 const STATUSES = new Set(["mapped", "scope-event", "decode-failed", "applied", "not-applied", "covered", "uncovered", "SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "READY", "WAITING", "QUEUED", "POST", "SUCCESS", "FAILED",
   // 1.25.42: POST 2xx is PROVISIONAL until an independent source (Stream
   // echo, or a bounded post-submit verification read) confirms the order is

@@ -239,7 +239,10 @@ class ChainAdapter {
       fees: (fees.fees || []).map(f => ({
         recipient: f.recipient, basisPoints: f.basisPoints
       })),
-      requiresSignedZone: Boolean(fees.requiresSignedZone),
+      // OpenSea SignedZone is required for exact-hash off-chain cancellation.
+      // This mirrors the current website/SDK item-offer shape and is resolved
+      // while hydrating the template, never on the realtime Stream→POST path.
+      requiresSignedZone: true,
       tokenStandard
     };
     this._collections.set(use, { at: Date.now(), value });
@@ -400,6 +403,21 @@ class ChainAdapter {
       this._balance = { at: now, address, wethWei: 0n, known: false };
       return this._balance;
     }
+  }
+
+  /**
+   * Exact-hash, off-chain-only cancellation for an order created by this
+   * engine. There is intentionally no on-chain fallback anywhere in this
+   * adapter: an automatic cleanup is never allowed to create a transaction
+   * or spend gas.
+   */
+  async cancelOwnOrderOffchain(orderHash, wallet, { signal } = {}) {
+    if (!wallet || typeof wallet.signTypedData !== "function") {
+      throw new Error("không có signer cho gasless cancel");
+    }
+    const config = await this.chainConfig();
+    const signature = await opensea.signOffchainCancel(wallet, config.chainId, orderHash);
+    return opensea.postOffchainCancel(this.chain, orderHash, signature, { signal });
   }
 
   /**

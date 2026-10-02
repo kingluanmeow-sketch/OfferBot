@@ -591,6 +591,37 @@ function apiPost(path, data, opts = {}) {
   });
 }
 
+/**
+ * Cancel one SignedZone order in OpenSea's off-chain orderbook.
+ * This primitive never falls back to an on-chain transaction, so automatic
+ * replacement can never spend gas. The current OpenSea schema uses the
+ * camelCase `offererSignature` wire field.
+ */
+async function postOffchainCancel(chain, orderHash, offererSignature, opts = {}) {
+  const c = normalizeChain(chain);
+  const hash = String(orderHash || "").toLowerCase();
+  if (!/^0x[0-9a-f]{64}$/.test(hash)) throw new Error("order hash không hợp lệ");
+  const signature = String(offererSignature || "");
+  if (!/^0x[0-9a-fA-F]+$/.test(signature)) throw new Error("thiếu chữ ký offerer cho gasless cancel");
+  const response = await apiPost(
+    `/orders/chain/${c}/protocol/${SEAPORT_V1_6}/${hash}/cancel`,
+    { offererSignature: signature },
+    { kind: KIND.CANCEL, priority: PRIORITY.P2, timeout: 20000, retries: 0,
+      label: "offchain-cancel", ...opts }
+  );
+  return response.data || {};
+}
+
+/** Sign the EIP-712 OrderHash proof required by off-chain cancellation. */
+function signOffchainCancel(wallet, chainId, orderHash) {
+  const domain = {
+    name: "Seaport", version: "1.6", chainId: Number(chainId),
+    verifyingContract: SEAPORT_V1_6
+  };
+  const types = { OrderHash: [{ name: "orderHash", type: "bytes32" }] };
+  return wallet.signTypedData(domain, types, { orderHash });
+}
+
 // ------------------------------------------------------------------
 // URL parsing
 // ------------------------------------------------------------------
@@ -2939,6 +2970,8 @@ module.exports = {
   request,
   apiGet,
   apiPost,
+  postOffchainCancel,
+  signOffchainCancel,
 
   // parsing / classification
   parseOpenSeaUrl,

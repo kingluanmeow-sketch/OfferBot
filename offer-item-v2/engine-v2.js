@@ -574,6 +574,16 @@ class OfferItemEngineV2 {
      * nothing outlives the row or a wallet switch.
      */
     this.ownConfirmTimers = new Map();
+    /**
+     * tokenKey -> { hash, attempt, timer, generation, afterCancel }
+     * Exact-hash gasless cleanup is per NFT, latest-wins and bounded.  It is
+     * never part of P0 Stream→POST and never has an on-chain fallback.
+     */
+    this.ownCancelJobs = new Map();
+    /** tokenKey -> the one independently-confirmed own hash we preserve. */
+    this.canonicalOwnHash = new Map();
+    /** Exact hashes created by this engine run; excludes manual/resynced offers. */
+    this.toolOwnHashes = new Map();
     /** tokenKey -> timer hẹn đọc lại lượt đầu; để reset dọn và watchdog biết. */
     this.firstReadTimers = new Map();
     /** tokenKey -> lần cuối đọc lại vì top bị huỷ (gap recovery). */
@@ -1538,6 +1548,10 @@ class OfferItemEngineV2 {
     this.ownWaitTimers.clear();
     for (const timer of this.ownConfirmTimers.values()) clearTimeout(timer);
     this.ownConfirmTimers.clear();
+    for (const job of this.ownCancelJobs.values()) if (job.timer) clearTimeout(job.timer);
+    this.ownCancelJobs.clear();
+    this.canonicalOwnHash.clear();
+    this.toolOwnHashes.clear();
     this.inFlightSince.clear();
     for (const pr of this.pendingReads.values()) if (pr.timer) clearTimeout(pr.timer);
     this.pendingReads.clear();
@@ -1622,6 +1636,11 @@ class OfferItemEngineV2 {
     const oct = this.ownConfirmTimers.get(key);
     if (oct) clearTimeout(oct);
     this.ownConfirmTimers.delete(key);
+    const ocj = this.ownCancelJobs.get(key);
+    if (ocj && ocj.timer) clearTimeout(ocj.timer);
+    this.ownCancelJobs.delete(key);
+    this.canonicalOwnHash.delete(key);
+    this.toolOwnHashes.delete(key);
     this.clearHydrating(key);
     this.awaitingFirstRead.delete(key);
     this.downwardAuthority.delete(key);
@@ -5410,6 +5429,11 @@ class OfferItemEngineV2 {
     const now = Date.now();
     book.ownKnownAt = now;
     const hash = orderHash || `pending:${book.key}:${now}`;
+    if (orderHash && /^0x[0-9a-fA-F]{64}$/.test(String(orderHash))) {
+      let created = this.toolOwnHashes.get(book.key);
+      if (!created) { created = new Set(); this.toolOwnHashes.set(book.key, created); }
+      created.add(String(orderHash).toLowerCase());
+    }
     // The SIGNED endTime is the order's real expiry (1.25.10). Rebuilding it
     // from "now + duration" after the POST returned placed the local expiry
     // later than the order by the build/sign/network time, so the renew woke
@@ -5474,6 +5498,119 @@ class OfferItemEngineV2 {
   }
 
   /**
+   * Queue one exact own hash for SignedZone off-chain cancellation.
+   *
+   * The queue is per NFT and deduplicated.  It runs in the recovery plane,
+   * yields to realtime pressure, signs locally and calls the adapter's
+   * off-chain-only primitive.  There is deliberately no path to an on-chain
+   * transaction. A failed cleanup remains represented by a real timer/job;
+   * it can never become an orphaned WAITING state.
+   */
+  queueGaslessCancel(key, row, orderHash, why = "stale") {
+    const hash = String(orderHash || "").toLowerCase();
+    if (!/^0x[0-9a-f]{64}$/.test(hash)) return false;
+    // Maker equality does not prove the bot created an order. A same-wallet
+    // manual offer may enter MemoryBook through Stream/REST and must survive.
+    if (!this.toolOwnHashes.get(key)?.has(hash)) return false;
+    if (!this.adapter || typeof this.adapter.cancelOwnOrderOffchain !== "function") return false;
+    let state = this.ownCancelJobs.get(key);
+    if (!state) {
+      state = { pending: [], seen: new Set(), active: false, timer: null,
+        generation: this.recovery.generation, epoch: this.epoch };
+      this.ownCancelJobs.set(key, state);
+    }
+    if (state.seen.has(hash)) return true;
+    state.seen.add(hash);
+    state.pending.push({ hash, why, attempt: 0 });
+
+    const pump = () => {
+      const current = this.ownCancelJobs.get(key);
+      if (current !== state || state.active || state.timer) return;
+      if (this.state !== STATE.RUNNING || state.epoch !== this.epoch ||
+          state.generation !== this.recovery.generation || !this.rows.has(key)) {
+        this.ownCancelJobs.delete(key);
+        return;
+      }
+      const item = state.pending[0];
+      if (!item) { this.ownCancelJobs.delete(key); return; }
+      state.active = true;
+      const scheduled = this.recovery.push({
+        kind: "own-gasless-cancel", priority: 2,
+        run: async ({ signal }) => {
+          try {
+            const wallet = this.builder && this.builder.wallet;
+            const data = await this.adapter.cancelOwnOrderOffchain(item.hash, wallet, { signal });
+            return { ok: true, hash: item.hash, data, generation: state.generation, epoch: state.epoch };
+          } catch (error) {
+            // RecoveryPlane intentionally reports thrown jobs only to logs;
+            // return a typed failure so this per-NFT lifecycle can release
+            // `active` and retain a real bounded-backoff retry timer.
+            return { ok: false, hash: item.hash,
+              error: String(error?.message || error), status: Number(error?.response?.status || 0),
+              generation: state.generation, epoch: state.epoch };
+          }
+        },
+        onResult: result => {
+          state.active = false;
+          if (!result || result.generation !== this.recovery.generation ||
+              result.epoch !== this.epoch || this.ownCancelJobs.get(key) !== state) return;
+          if (!result.ok) { retry(result.status ? `HTTP ${result.status}` : result.error); return; }
+          state.pending.shift();
+          const book = this.book.get(key);
+          if (book) {
+            book.own.delete(item.hash);
+            book.tombstone(item.hash, Date.now());
+            book.generation++;
+          }
+          this.toolOwnHashes.get(key)?.delete(item.hash);
+          this.stats.gaslessCancelled = (this.stats.gaslessCancelled || 0) + 1;
+          this.log(`[OWN CANCEL] #${row.tokenId} ${item.hash.slice(0, 10)}… hủy off-chain, không gas (${item.why})`);
+          productionTrace.record("own_cancel", {}, {
+            chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+            status: "SUCCESS", reason: item.why, orderHash: item.hash
+          });
+          if (row.running) { row.retryAt = 0; this.evaluate(key, Date.now(), null); this.pump(); }
+          pump();
+        },
+        onDrop: () => retry("dropped")
+      });
+      if (!scheduled) retry("not-scheduled");
+    };
+
+    const retry = reason => {
+      if (this.ownCancelJobs.get(key) !== state) return;
+      state.active = false;
+      const item = state.pending[0];
+      if (!item) { pump(); return; }
+      item.attempt++;
+      const wait = Math.min(60000, 2000 * Math.pow(2, Math.min(5, item.attempt - 1)));
+      this.stats.gaslessCancelFailed = (this.stats.gaslessCancelFailed || 0) + 1;
+      this.log(`[OWN CANCEL] #${row.tokenId} ${item.hash.slice(0, 10)}… chưa hủy được (${reason}), thử lại ${wait}ms`);
+      state.timer = setTimeout(() => { state.timer = null; pump(); }, wait);
+      state.timer.unref?.();
+    };
+
+    pump();
+    return true;
+  }
+
+  /** Promote a confirmed hash, then clean older exact hashes in background. */
+  promoteCanonicalOwn(key, row, orderHash) {
+    const hash = String(orderHash || "").toLowerCase();
+    const book = this.book.get(key);
+    if (!book || !hash) return;
+    this.canonicalOwnHash.set(key, hash);
+    const createdByTool = this.toolOwnHashes.get(key);
+    if (!createdByTool || !createdByTool.has(hash)) return;
+    for (const [oldHash, old] of book.own) {
+      const h = String(oldHash || "").toLowerCase();
+      if (h === hash || h.startsWith("pending:")) continue;
+      if (!createdByTool.has(h)) continue;
+      this.queueGaslessCancel(key, row, h, "replaced");
+    }
+  }
+
+  /**
    * Xác nhận có giới hạn, theo đúng NFT, cho một own order vừa POST (1.25.42).
    *
    *   Chỉ chạy khi Stream CHƯA tự xác nhận trong lúc chờ (xem TokenBook.apply()
@@ -5486,11 +5623,9 @@ class OfferItemEngineV2 {
    *   BOUNDED: tối đa 2 lượt đọc (6s, rồi 14s nếu lượt đầu chưa thấy), không
    *   vòng lặp vô hạn, không global polling, không chặn P0 Stream→POST --
    *   chạy qua RecoveryPlane ở priority nền, y hệt mọi recovery read khác.
-   *   KHÔNG cancel, KHÔNG gửi lại, KHÔNG đổi target -- chỉ xác nhận hoặc ghi
-   *   nhận "chưa xác nhận được" rồi để chu kỳ evaluate() bình thường (Stream,
-   *   watchdog, lần đánh giá kế tiếp) quyết định NFT có cần gửi tiếp hay
-   *   không, dựa trên effectiveBest() thật -- vốn đã luôn bỏ qua own order
-   *   (confirmed hay chưa) nên competitor không bao giờ bị che bởi bước này.
+   *   Khi cả hai lượt thất bại, chỉ exact hash do chính engine vừa POST được
+   *   hủy off-chain SignedZone ở P2 trước replacement. Không có on-chain
+   *   fallback; offer thủ công/offer chỉ phát hiện qua REST không bị đụng tới.
    */
   scheduleOwnConfirmation(key, row, orderHash, correlationId = "") {
     if (!orderHash || typeof this.adapter.fetchBest !== "function") return;
@@ -5567,6 +5702,7 @@ class OfferItemEngineV2 {
               entry.confirmed = true;
               book.generation++;
               row.ownConfirmFailStreak = 0;
+              this.promoteCanonicalOwn(key, row, orderHash);
               this.log(`[OWN] XÁC NHẬN NFT #${row.tokenId} order ${orderHash.slice(0, 10)}… là giá cao nhất trong lượt đọc toàn bộ danh sách offer, mới ` +
                 `(bằng chứng công khai mạnh nhất không cần thêm request -- API không công bố trường funded/unfunded riêng, không phải xác nhận trực tiếp từ /best của OpenSea)`);
               productionTrace.record("submit_success", { correlationId }, {
@@ -5608,10 +5744,16 @@ class OfferItemEngineV2 {
               row.ownConfirmFailStreak = (row.ownConfirmFailStreak || 0) + 1;
               const policy = RETRY_POLICY["own-confirm-failed"];
               const backoff = Math.min(policy.max, policy.base * Math.pow(2, Math.min(6, row.ownConfirmFailStreak - 1)));
-              row.retryAt = Date.now() + backoff;
+              // Do not stack another signed order on top of a proven failed
+              // hash. Remove that exact SignedZone order off-chain first;
+              // successful cleanup wakes this row immediately. If scheduling
+              // is unavailable, preserve the old bounded resend backoff.
+              const cancelQueued = this.queueGaslessCancel(key, row, orderHash, "unconfirmed");
+              row.retryAt = cancelQueued ? 0 : Date.now() + backoff;
               this.log(`[OWN] KHÔNG xác nhận được NFT #${row.tokenId} order ${orderHash.slice(0, 10)}… là giá cao nhất sau xác nhận có giới hạn` +
                 (result.isListed ? " (order CÓ trong danh sách offers nhưng KHÔNG phải giá cao nhất -- có thể Unfunded hoặc bị vượt giá)" : " (order không thấy trong danh sách offers)") +
-                ` — không còn tính vào mine, competitor giữ nguyên effectiveBest, chu kỳ #${row.ownConfirmFailStreak} lùi ${backoff}ms`);
+                ` — không còn tính vào mine, competitor giữ nguyên effectiveBest, ` +
+                (cancelQueued ? "đang hủy gasless exact-hash trước replacement" : `chu kỳ #${row.ownConfirmFailStreak} lùi ${backoff}ms`));
               productionTrace.record("submit_failure", { correlationId }, {
                 chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
                 status: "FAILED", reason: "unconfirmed"
@@ -5620,7 +5762,17 @@ class OfferItemEngineV2 {
               // so this row gets a fresh real decision immediately (subject
               // to the backoff just set above via row.retryAt), not whenever
               // some unrelated future event happens to fire.
-              if (row.running && this.state === STATE.RUNNING) { this.evaluate(key, Date.now(), null); this.pump(); }
+              if (row.running && this.state === STATE.RUNNING) {
+                if (cancelQueued) {
+                  this.setIntent(key, INTENT.WAITING, {
+                    lastError: "Đang hủy lệnh ! cũ không gas",
+                    dependency: "own-cancel", waitingSince: Date.now()
+                  });
+                  this.changed();
+                } else {
+                  this.evaluate(key, Date.now(), null); this.pump();
+                }
+              }
             } else {
               attempt(14000, true);
             }
