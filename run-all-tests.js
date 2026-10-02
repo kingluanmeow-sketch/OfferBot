@@ -6,6 +6,7 @@ const { spawnSync } = require("node:child_process");
 const suites = [
   { file: "tools/build-gate.js" },
   { file: "numeric-trait-offer-test.js" },
+  { file: "stream-best-stale-trait-scope-test.js" },
   { file: "opensea-criteria-test.js" },
   { file: "offer-item-v2-recovery-lifecycle-test.js" },
   { file: "offer-item-v2-topic-recovery-test.js" },

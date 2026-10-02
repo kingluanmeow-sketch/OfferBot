@@ -181,6 +181,18 @@ const TRAIT_PROBE_COOLDOWN_MS = 60 * 1000;
 /** Và tối đa bấy nhiêu token cho MỘT sự kiện trait offer. */
 const TRAIT_PROBE_MAX_PER_EVENT = 8;
 /**
+ * TRAIT-SCOPE RETRY: CÓ TRẦN, CÓ BACKOFF, KHÔNG BÃO REST (audit mở rộng)
+ *
+ *   Retry khi bị stale-discard (xem mergeBest) phải tự giới hạn: một
+ *   collection LIÊN TỤC bận (event chạm sổ nhanh hơn một round-trip REST)
+ *   không được biến thành bão request nhắm đúng một token. Trần cứng + lùi
+ *   theo cấp số nhân (bounded) là cách duy nhất chặn cả hai mà vẫn còn cơ
+ *   hội phục hồi khi collection tạm lắng xuống.
+ */
+const TRAIT_SCOPE_RETRY_MAX_ATTEMPTS = 5;
+const TRAIT_SCOPE_RETRY_BACKOFF_BASE_MS = 300;
+const TRAIT_SCOPE_RETRY_BACKOFF_MAX_MS = 5000;
+/**
  * Nhịp dọn lệnh hết hạn theo đồng hồ local. Chỉ quét bộ nhớ; 10 giây là đủ
  * mịn cho hạn tính bằng phút và đủ thưa để không đáng kể với 1000 sổ.
  */
@@ -442,6 +454,16 @@ class OfferItemEngineV2 {
 
     /** tokenKey -> lần cuối đi hỏi phạm vi của một trait offer. */
     this.traitProbedAt = new Map();
+    /**
+     * tokenKey -> { attempts, firstAt, timer } cho lượt retry trait-scope
+     * sau khi bị mergeBest() discard vì stale (xem ghi chú ở mergeBest).
+     * Single-flight THẬT: `timer` tồn tại ⇒ đã có đúng một retry đang hẹn
+     * giờ cho key này, một discard khác đến trong lúc đó không hẹn thêm cái
+     * thứ hai. `attempts` chặn bão REST trên một collection bận liên tục,
+     * `firstAt` đo thời gian phục hồi thật (từ discard đầu tới lúc settle
+     * thành công hoặc bỏ cuộc) cho `stats.traitScopeRecoveryMs`.
+     */
+    this.traitScopeRetry = new Map();
 
     /**
      * NHỊP DỌN LỆNH HẾT HẠN — đồng hồ local, không cần mạng.
@@ -619,7 +641,13 @@ class OfferItemEngineV2 {
     this.net = null;
 
     this.stats = { events: 0, applied: 0, decided: 0, submitted: 0, dropped: 0,
-      traitProbes: 0, traitProbeSkipped: 0 };
+      traitProbes: 0, traitProbeSkipped: 0,
+      // Chẩn đoán retry trait-scope (audit mở rộng, xem mergeBest + traitScopeRetry):
+      // tổng số lượt retry đã xếp, số lần bỏ cuộc vì chạm trần, số lần phục hồi
+      // thành công, và tổng thời gian phục hồi (ms, từ discard đầu tới settle) --
+      // traitScopeRecoveryMsTotal/traitScopeRecoveries = thời gian phục hồi trung bình.
+      traitScopeRetries: 0, traitScopeRetryGaveUp: 0,
+      traitScopeRecoveries: 0, traitScopeRecoveryMsTotal: 0 };
     this.pumping = false;
 
     /**
@@ -1479,6 +1507,10 @@ class OfferItemEngineV2 {
     this.downwardAuthority.clear();
     this.topicRepairAt.clear();
     this.traitProbedAt.clear();
+    // Mọi timer retry trait-scope đang hẹn thuộc thế hệ CŨ -- huỷ hẳn thay vì
+    // chỉ trông cậy generation-check lúc bắn, vì Reset đã dọn book/row rồi.
+    for (const state of this.traitScopeRetry.values()) if (state.timer) clearTimeout(state.timer);
+    this.traitScopeRetry.clear();
     this.traits.retain([...this.rows.keys()]);
     this.balanceProbedAt = 0;
     this.balanceResultAt = 0;
@@ -1612,6 +1644,9 @@ class OfferItemEngineV2 {
     this.firstPostCompleted.delete(key);
     this.gapReadAt.delete(key);
     this.traitProbedAt.delete(key);
+    const tsr = this.traitScopeRetry.get(key);
+    if (tsr && tsr.timer) clearTimeout(tsr.timer);
+    this.traitScopeRetry.delete(key);
     const ts = this.templateState.get(key);
     if (ts && ts.timer) clearTimeout(ts.timer);
     this.templateState.delete(key);
@@ -4629,6 +4664,76 @@ class OfferItemEngineV2 {
   }
 
   /**
+   * Hẹn giờ một lượt retry trait-scope sau khi mergeBest() discard nó vì
+   * stale (xem ghi chú ở mergeBest). BA bất biến bắt buộc:
+   *
+   *   SINGLE-FLIGHT   `state.timer` tồn tại ⇒ đã có đúng một hẹn giờ cho
+   *                   key này; một discard khác đến giữa lúc đó không hẹn
+   *                   thêm cái thứ hai (test: "146 NFT đồng thời" không tạo
+   *                   bão timer).
+   *   CÓ TRẦN         quá TRAIT_SCOPE_RETRY_MAX_ATTEMPTS thì bỏ cuộc, dọn
+   *                   hẳn -- một collection liên tục bận không được thành
+   *                   vòng lặp vô hạn nhắm một token.
+   *   LÙI CÓ GIỚI HẠN mỗi lần thử lại chờ lâu hơn (cấp số nhân, trần
+   *                   TRAIT_SCOPE_RETRY_BACKOFF_MAX_MS) -- cho collection
+   *                   một cơ hội thật để lắng bớt trước lượt kế.
+   *
+   * GENERATION-SAFE: timer tự kiểm `this.recovery.generation` lúc BẮN, không
+   * phải lúc HẸN -- một Reset/Stop/đổi ví xảy ra giữa hai mốc đó phải làm
+   * retry tự bỏ, không chạy vào book/row của một thế hệ đã chết.
+   */
+  scheduleTraitScopeRetry(key) {
+    const existing = this.traitScopeRetry.get(key);
+    if (existing && existing.timer) return; // single-flight: đã có một hẹn giờ
+    const attempts = (existing?.attempts || 0) + 1;
+    if (attempts > TRAIT_SCOPE_RETRY_MAX_ATTEMPTS) {
+      this.stats.traitScopeRetryGaveUp++;
+      this.traitScopeRetry.delete(key);
+      const row = this.rows.get(key);
+      this.log(`[TRAIT-SCOPE] #${row?.tokenId || key} bỏ cuộc sau ${attempts - 1} lượt retry -- ` +
+        `collection vẫn bận liên tục; chờ sự kiện trait kế tiếp (cooldown ${TRAIT_PROBE_COOLDOWN_MS}ms) để hỏi lại.`);
+      return;
+    }
+    const generation = this.recovery.generation;
+    const firstAt = existing?.firstAt || Date.now();
+    const backoff = Math.min(TRAIT_SCOPE_RETRY_BACKOFF_MAX_MS,
+      TRAIT_SCOPE_RETRY_BACKOFF_BASE_MS * Math.pow(2, attempts - 1));
+    const timer = setTimeout(() => {
+      const cur = this.traitScopeRetry.get(key);
+      if (cur) cur.timer = null;
+      if (this.state !== STATE.RUNNING || generation !== this.recovery.generation) {
+        this.traitScopeRetry.delete(key);
+        return;
+      }
+      const row = this.rows.get(key);
+      if (!row || !row.running) { this.traitScopeRetry.delete(key); return; }
+      this.stats.traitScopeRetries++;
+      // `queueRead` tự dedupe single-flight THẬT ở tầng HTTP (hydrating.has)
+      // nếu một lượt đọc khác đang bay cho đúng key này -- không tạo lượt
+      // thứ hai, chỉ gộp cờ authoritative vào lượt đang có.
+      this.queueRead(row, { reason: "trait-scope", authoritative: true, readAt: Date.now(), firstRead: false, attempt: attempts });
+    }, backoff);
+    timer.unref?.();
+    this.traitScopeRetry.set(key, { attempts, firstAt, timer });
+  }
+
+  /**
+   * Một lượt đọc trait-scope SETTLE THẬT (không bị discard) -- chuỗi retry
+   * (nếu có) coi như đã phục hồi. Đo thời gian phục hồi (từ discard đầu tới
+   * đây) vào `stats.traitScopeRecoveryMsTotal`/`traitScopeRecoveries` và dọn
+   * hẳn, để timer cũ (nếu đang hẹn) không bắn vào một câu hỏi đã có câu trả
+   * lời (orphan-free: không timer nào sống sót qua một thành công).
+   */
+  settleTraitScopeRetry(key) {
+    const state = this.traitScopeRetry.get(key);
+    if (!state) return;
+    if (state.timer) clearTimeout(state.timer);
+    this.stats.traitScopeRecoveries++;
+    this.stats.traitScopeRecoveryMsTotal += Date.now() - state.firstAt;
+    this.traitScopeRetry.delete(key);
+  }
+
+  /**
    * Nạp trait cho mọi hàng, ở nền, theo lô — rồi đưa vào sổ.
    *
    *   Chạy qua RecoveryPlane để có cùng bộ giới hạn, cùng generation và cùng
@@ -4744,6 +4849,42 @@ class OfferItemEngineV2 {
         this.queueRead(row, { reason: intent.dependency === "post-reconcile" ? "post-uncertain" : "pre-post-own",
           authoritative: false, readAt: Date.now(), firstRead: false, attempt: 1 });
       }
+      /**
+       * TRAIT-SCOPE BỊ FENCE TRÊN COLLECTION BẬN = KHÓA VĨNH VIỄN (audit)
+       *
+       *   `resolveTraitScope` là ĐƯỜNG DUY NHẤT để một trait/collection offer
+       *   UNKNOWN (chưa biết trait của token) được xác nhận có áp hay không --
+       *   không có nhịp quét nào khác hỏi lại câu này. Bản trước: lượt đọc
+       *   authoritative này bị fence y như mọi lượt đọc khác khi BẤT KỲ sự
+       *   kiện Stream nào (kể cả không liên quan: một item bid khác trên cùng
+       *   token) chạm `book.lastEventAt` trong lúc nó bay -- và trên một
+       *   collection bận, xác suất đó gần như 100%. Kết quả đo được: Best bị
+       *   kẹt dưới giá thật mãi (ví dụ production: Alien Fren #6456 UI 0.0119,
+       *   tool giữ 0.01; Parallel Avatars Jazmine #10184 giữ 0.03; Heracles
+       *   #8375 giữ 0.02) -- trait offer cao hơn không bao giờ được xác nhận,
+       *   và TRAIT_PROBE_COOLDOWN_MS (60s) khoá luôn cả lượt hỏi lại từ sự
+       *   kiện trait kế tiếp.
+       *
+       *   Các dependency "own"/"post-reconcile" ở trên đã có đúng cơ chế này
+       *   (retry ngay khi bị fence) -- trait-scope chỉ là một case còn thiếu
+       *   của CÙNG một nguyên tắc: một lượt đọc authoritative đang giải quyết
+       *   một câu hỏi mà Stream không có cách nào tự trả lời phải được thử
+       *   lại, không được âm thầm rơi mất.
+       *
+       *   NHƯNG retry NGAY, không trần, không lùi (bản đầu của fix) là tự mở
+       *   đường cho đúng thứ fence này đang chặn: trên một collection LIÊN
+       *   TỤC bận (event chạm sổ nhanh hơn một round-trip REST), mỗi retry
+       *   lại bị discard ngay, và nếu không trần thì đó là một bão REST nhắm
+       *   đúng một token -- audit mở rộng yêu cầu rõ "không REST retry storm,
+       *   không retry vô hạn". `scheduleTraitScopeRetry` dưới đây chịu trách
+       *   nhiệm: single-flight (một timer cho mỗi key), trần cứng
+       *   (TRAIT_SCOPE_RETRY_MAX_ATTEMPTS), lùi theo cấp số nhân có giới hạn,
+       *   và generation-safe (tự bỏ nếu Reset/Stop/đổi ví xảy ra trước khi
+       *   timer bắn).
+       */
+      if (ownedRead && reason === "trait-scope") {
+        this.scheduleTraitScopeRetry(key);
+      }
       const cold = this.awaitingFirstRead.has(key) && !(book.hydratedAt > 0 && book.effectiveBest(now).price > 0);
       if (cold && row?.running && this.state === STATE.RUNNING) {
         setImmediate(() => {
@@ -4765,6 +4906,11 @@ class OfferItemEngineV2 {
     }
 
     const settle = () => {
+      // Thành công thật (không bị fence ở trên): nếu key này có một chuỗi
+      // retry trait-scope đang mở, nó đã PHỤC HỒI -- đo thời gian phục hồi
+      // (từ discard đầu tới đây) và dọn hẳn, không để timer cũ bắn lại vào
+      // một câu hỏi đã có câu trả lời.
+      if (reason === "trait-scope") this.settleTraitScopeRetry(key);
       book.hydratedAt = now;
       // Cả danh sách vừa được ghép: từ mốc đọc này sổ có thẩm quyền để đặt lại.
       if (!quick) {
