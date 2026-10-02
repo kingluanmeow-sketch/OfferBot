@@ -7,6 +7,8 @@ const suites = [
   { file: "tools/build-gate.js" },
   { file: "numeric-trait-offer-test.js" },
   { file: "stream-best-stale-trait-scope-test.js" },
+  { file: "stream-mapped-not-applied-diagnostic-test.js" },
+  { file: "two-key-capacity-independence-test.js" },
   { file: "opensea-criteria-test.js" },
   { file: "offer-item-v2-recovery-lifecycle-test.js" },
   { file: "offer-item-v2-topic-recovery-test.js" },

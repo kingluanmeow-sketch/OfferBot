@@ -1917,10 +1917,50 @@ class OfferItemEngineV2 {
     if (touched.length) productionTrace.record("book_update", event, {
       chain: this.chain, collection: op.collectionSlug || event.collectionSlug,
       tokenId: op.tokenId, affected: touched.length,
-      status: touched.length ? "applied" : "not-applied",
+      status: "applied",
       previousBest: trackedNftKey ? preEventBest : null,
       best: trackedBookAfter ? trackedBookAfter.effectiveBest(receivedAt).price : null
     });
+    /**
+     * "MAPPED NHƯNG KHÔNG ÁP" — KHOẢNG TRỐNG THẬT TỪ 1.25.40 (audit mở rộng)
+     *
+     *   Dòng ghi `book_update` phía trên CHỈ viết khi `touched.length` dương
+     *   -- nhánh "not-applied" chưa bao giờ thật sự chạy, dù code cũ đã TÍNH
+     *   SẴN `status: "not-applied"` cho nó (dead branch). Hậu quả đo được:
+     *   `stream_rx` ghi "mapped" cho một op, rồi im lặng tuyệt đối -- không
+     *   ai biết `apply()` từ chối nó vì lý do gì (production: Alien Fren
+     *   #6456, Parallel Avatars Jazmine #10184/Heracles #8375, Nibble #7192
+     *   -- `collection_offer`/`trait_offer` liên tục mapped, Best không bao
+     *   giờ đổi, và trace không để lại dấu vết TẠI SAO).
+     *
+     *   `touched.notApplied` (memory-book.js, `diagnoseApply()`) đã phân
+     *   loại ĐÚNG lý do ngay tại nơi apply() từ chối, không mutate, không
+     *   mạng. Ở đây chỉ ghi nó ra -- bounded (đúng số NFT đang theo dõi bị
+     *   op này chạm tới, không hơn) và secret-safe (chỉ orderHash công khai,
+     *   giá, kind, không địa chỉ ví đầy đủ, không signature, không key).
+     *
+     *   "duplicate" (giá/hạn giống y bản cũ -- dual-feed echo bình thường,
+     *   cực phổ biến) và "no-op" (REMOVE/cancel không khớp hash nào trong sổ
+     *   -- fan-out theo collection của một cancel KHÔNG liên quan chạm MỌI
+     *   token đang theo dõi, nên gần như luôn là "no-op" ở từng token, đúng
+     *   như comment phía trên giải thích) CHỦ Ý không ghi, để không lặp lại
+     *   đúng kiểu nghẽn I/O mà bản 1.25.40 từng đo (~8 MB/min nếu ghi mọi
+     *   echo/cancel-không-liên-quan trên MỌI token của một collection bận)
+     *   -- mọi lý do CÒN LẠI (stale/version-stale/tombstoned/trait-no-match/
+     *   trait-unknown/expired) chỉ xảy ra cho một UPSERT thật và đáng chẩn
+     *   đoán, được ghi đầy đủ.
+     */
+    if (touched.notApplied && touched.notApplied.length) {
+      for (const { key, reason } of touched.notApplied) {
+        if (reason === "duplicate" || reason === "no-op" || !this.rows.has(key)) continue;
+        const row = this.rows.get(key);
+        productionTrace.record("book_update", event, {
+          chain: this.chain, collection: op.collectionSlug || event.collectionSlug,
+          tokenId: row.tokenId, affected: 0, status: "not-applied", reason,
+          orderHash: op.orderHash || "", price: op.price, kind: op.kind
+        });
+      }
+    }
     if (op.endTime > 0 && touched.length) this.noteExpiry(op.endTime);
     // Drift diagnostics (1.25.1): a Stream REMOVE that matched nothing in any
     // tracked book vs one that did. REST later finding a dead order that a
