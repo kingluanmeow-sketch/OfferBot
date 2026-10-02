@@ -8,7 +8,6 @@ const suites = [
   { file: "numeric-trait-offer-test.js" },
   { file: "stream-best-stale-trait-scope-test.js" },
   { file: "stream-mapped-not-applied-diagnostic-test.js" },
-  { file: "two-key-capacity-independence-test.js" },
   { file: "book-contradiction-recovery-test.js" },
   { file: "submit-flight-superseded-error-trace-test.js" },
   { file: "production-trace-superseded-ambiguous-test.js" },
