@@ -2567,6 +2567,21 @@ class OfferItemEngineV2 {
     const now = Date.now();
     const last = this.unmappableItemEventProbedAt.get(key) || 0;
     if (now - last < UNMAPPABLE_ITEM_EVENT_COOLDOWN_MS) return false;
+    const inFlight = this.pendingReads.get(key);
+    if (this.hydrating.has(key) && inFlight?.startedAt && inFlight.startedAt <= receivedAt) {
+      // This snapshot left before the event and may not contain the order.
+      // Record one follow-up instead of treating the old read as coverage.
+      // If another path already armed a weaker re-read, upgrade that same
+      // coalesced debt to an authoritative item-event repair.
+      if (!inFlight.rereadPending || inFlight.rereadAuthoritative !== true) {
+        inFlight.rereadPending = true;
+        inFlight.rereadReason = "unmappable-item-event";
+        inFlight.rereadAuthoritative = true;
+      }
+      this.unmappableItemEventProbedAt.set(key, now);
+      this.stats.unmappableItemEventProbes = (this.stats.unmappableItemEventProbes || 0) + 1;
+      return true;
+    }
     const queued = this.queueRead(row, {
       reason: "unmappable-item-event", authoritative: true,
       readAt: receivedAt, firstRead: false, attempt: 1,

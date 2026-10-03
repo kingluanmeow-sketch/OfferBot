@@ -1,6 +1,6 @@
 {
   "name": "opensea-offer-bot",
-  "version": "1.25.68",
+  "version": "1.25.69",
   "description": "OpenSea Offer Bot - Electron / Seaport 1.6 / OpenSea Stream API",
   "author": "OpenSea Offer Bot",
   "license": "UNLICENSED",

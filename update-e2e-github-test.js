@@ -91,7 +91,7 @@ const pkg = require(path.join(ROOT, "package.json"));
 const TARGET_VERSION = pkg.version;
 // What `currentVersion` the feed check reports as already-installed. See
 // the SCOPE note above: this does not reproduce a packaged binary's bytes.
-const BASELINE_VERSIONS = ["1.25.61", "1.25.62", "1.25.63", "1.25.64", "1.25.65", "1.25.66", "1.25.67"];
+const BASELINE_VERSIONS = ["1.25.61", "1.25.62", "1.25.63", "1.25.64", "1.25.65", "1.25.66", "1.25.67", "1.25.68"];
 
 const FORBIDDEN_CACHE_SUBSTRINGS = ["\\Electron\\pending", "/Electron/pending", "OpenSea Offer Bot", "opensea-offer-bot"];
 

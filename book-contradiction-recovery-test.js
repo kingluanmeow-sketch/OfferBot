@@ -129,6 +129,33 @@ await check("tracked item bid with unusable price triggers one asynchronous, per
   assert.equal(book.effectiveBest(Date.now()).price, 0.0219, "the targeted authority result must repair the local Best");
 });
 
+await check("unmappable item bid during an older in-flight read arms exactly one authoritative follow-up", async () => {
+  const { engine, row, book, resolvers, reads } = buildEngine({ rows: [{ tokenId: "2bf", slug: "coll" }] });
+  engine.queueRead(row, { reason: "contradiction", authoritative: false, readAt: Date.now(), firstRead: false, attempt: 1 });
+  await flush();
+  assert.equal(resolvers.length, 1, "the older read must be in flight before the Stream event arrives");
+  const malformed = bidEvent({ slug: "coll", tokenId: "2bf", maker: RIVAL, price: 0.02, orderHash: "0xarrived-after-start" });
+  delete malformed.pricePerItem;
+  engine.apply(malformed);
+  assert.equal(engine.pendingReads.get(row.key).rereadPending, true, "the already-started snapshot cannot be trusted to include this event");
+  engine.apply(malformed);
+  assert.equal(resolvers.length, 1, "a duplicate frame must not start another concurrent read");
+  resolvers[0]({ orderHash: "0xold-snapshot", price: 0.01, orders: [
+    { orderHash: "0xold-snapshot", price: 0.01, maker: RIVAL, kind: "item", endTime: 0, quantity: 1 }
+  ] });
+  await flush();
+  assert.equal(resolvers.length, 2, "exactly one follow-up should run after the older read settles");
+  assert.equal(reads[1].options.priority, PRIORITY.P2, "the follow-up remains background P2");
+  assert.equal(engine.pendingReads.get(row.key).reason, "unmappable-item-event");
+  assert.equal(engine.pendingReads.get(row.key).authoritative, true);
+  resolvers[1]({ orderHash: "0xconfirmed-latest", price: 0.0201, orders: [
+    { orderHash: "0xconfirmed-latest", price: 0.0201, maker: RIVAL, kind: "item", endTime: 0, quantity: 1 }
+  ] });
+  await flush();
+  assert.equal(book.effectiveBest(Date.now()).price, 0.0201, "the follow-up authority must repair Best after the stale first snapshot");
+  assert.equal(engine.pendingReads.has(row.key), false, "the bounded read lifecycle must settle cleanly");
+});
+
 await check("unmappable item-event recovery is bounded per NFT and does not fan out to other rows", async () => {
   const { engine, resolvers } = buildEngine({ rows: [
     { tokenId: "2c", slug: "coll" }, { tokenId: "2d", slug: "coll" }
