@@ -32,6 +32,7 @@
  */
 const assert = require("node:assert/strict");
 const { OfferItemEngineV2, STATE } = require("./offer-item-v2/engine-v2");
+const { decide, STATUS } = require("./offer-item-v2/decision");
 
 let passed = 0, failed = 0;
 async function check(name, fn) {
@@ -212,6 +213,84 @@ await check("no polling: the fix is purely event-count-driven -- with ZERO incom
   const { engine, resolvers } = buildEngine();
   await new Promise(r => setTimeout(r, 150)); // real wall-clock wait, no events at all
   assert.equal(resolvers.length, 0, "with no incoming Stream events whatsoever, nothing must spontaneously trigger a reconcile read -- purely event-driven, never a timer");
+});
+
+// ---- TROLLS #1312 (production proof, extended from the same mechanism):
+// own order vanished on OpenSea but stayed "alive" in the local book --
+// stale-streak-reconcile must trigger a FULL authoritative read (not a
+// quick single-order fetch), which exercises pruneLostOwn() and sends the
+// correct fresh competitor+step price. ----
+await check("TROLLS #1312: own order that disappeared on OpenSea gets pruned by the SAME stale-streak-reconcile trigger, and the correct fresh price is sent", async () => {
+  const { engine, key, row, book, resolvers } = buildEngine();
+  // This scenario's real target (~0.0556) exceeds buildEngine()'s shared
+  // #6490-sized maxPrice (0.021) -- raise the ceiling to the real
+  // TROLLS #1312 trace value so decide() isn't tripped by an unrelated cap.
+  row.maxPrice = 0.095;
+  // fetchBestQuick exists on the adapter -- if the reconcile read ever
+  // degraded to "quick" (the exact bug class this proof targets), this
+  // resolver array would be used instead of the full fetchBest() one,
+  // and pruneLostOwn (gated on !quick) would never run.
+  const quickResolvers = [];
+  engine.adapter.fetchBestQuick = (r, opts) => new Promise(res => quickResolvers.push(res));
+
+  const t0 = Date.now();
+  // Our own order is "live" in the local book at 0.0554, but it has
+  // ALREADY been cancelled/replaced on OpenSea (production reality) --
+  // old enough to be past OWN_LOST_GRACE_MS so pruneLostOwn is eligible
+  // to remove it once a full read actually runs.
+  book.own.set("0xmyold0554", {
+    orderHash: "0xmyold0554", price: 0.0554, maker: SELF, kind: "item",
+    quantity: 1, currency: "WETH", endTime: Math.floor(t0 / 1000) + 900,
+    assumedEnd: false, seq: 0, at: t0 - 120000
+  });
+  // A real external competitor at 0.0553 establishes Book's frozen belief
+  // (mirrors the exact 0.0553/0.0554 pair observed live for this NFT).
+  engine.apply({
+    collectionSlug: "npc-on-chain", nft: { chain: "ethereum", contract: CONTRACT, tokenId: "6490" },
+    kind: "item", orderHash: "0xcompeting0553", maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
+    eventTimestamp: t0, receivedAt: t0, hasOrderData: true, event: "item_received_bid", pricePerItem: 0.0553
+  });
+  await flush();
+  assert.equal(book.ownBest(Date.now()).price, 0.0554, "sanity: book still believes its own dead order is alive at 0.0554");
+
+  // 248 (production-observed count) cycles of legitimate racing noise --
+  // this is the exact pattern of the real TROLLS #1312 trace: every single
+  // one is an order_invalidate racing its own now-superseded create,
+  // correctly rejected stale, with zero successful applies in between.
+  for (let i = 0; i < 248; i++) {
+    const [remove, lateUpsert] = staleNoiseEvent({
+      slug: "npc-on-chain", tokenId: "6490", contract: CONTRACT,
+      price: 0.001, orderHash: `0xtrolls${i}`, eventTimestamp: t0 + 100 + i * 10
+    });
+    engine.apply(remove); engine.apply(lateUpsert);
+  }
+  await flush();
+
+  assert.equal(quickResolvers.length, 0, "the reconcile read must NEVER degrade to a quick single-order fetch -- authoritative:true must force a full list read so pruneLostOwn() actually runs");
+  assert.equal(resolvers.length, 1, "exactly one FULL authoritative reconcile read must have fired");
+
+  // Authority answers with the REAL current state: our old order is gone;
+  // a new external competitor now leads at 0.0555 (matches the live report).
+  resolvers[0]({ orderHash: "0xcompeting0553", price: 0.0555, orders: [
+    { orderHash: "0xnewexternal0555", price: 0.0555, maker: RIVAL, kind: "item", endTime: 0, quantity: 1 }
+  ] });
+  await flush();
+
+  assert.ok(!book.own.has("0xmyold0554"), "the dead own order must be pruned from book.own by pruneLostOwn() -- it is no longer on OpenSea");
+  assert.equal(book.ownBest(Date.now()).price, 0, "ownBest() must no longer report the dead order's price");
+  assert.equal(book.effectiveBest(Date.now()).price, 0.0555, "Book must now reflect the real external authority price");
+
+  // decide() on the now-corrected book state must want a FRESH send at
+  // best+step, not silently stay ON_TOP believing a dead order still wins
+  // (full SEND->submitOne->POST dispatch is proven by other suites in this
+  // repo with a full builder/http harness; this test's scope is specifically
+  // that the own-order prune + Book correction happened, which decide()
+  // then acts on correctly).
+  const best = book.effectiveBest(Date.now());
+  const mine = book.ownBest(Date.now());
+  const verdict = decide({ best: best.price, mine: mine.price, minPrice: row.minPrice, maxPrice: row.maxPrice, step: row.step });
+  assert.equal(verdict.status, STATUS.SEND, `decide() must want to SEND now that the dead own order is pruned and Book reflects real authority (0.0555), got ${verdict.status}`);
+  assert.ok(Math.abs(Number(verdict.target) - 0.0556) < 1e-9, `target must be the real competitor+step (0.0556), got ${verdict.target}`);
 });
 
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
