@@ -40,6 +40,7 @@ const suites = [
   { file: "priority-inversion-flight-test.js" },
   { file: "topic-lifecycle-test.js" },
   { file: "own-authority-startup-test.js" },
+  { file: "realtime-own-unknown-fastpath-test.js" },
   { file: "stream-dual-feed-test.js" },
   { file: "stream-dual-feed-wiring-test.js" },
   { file: "offer-item-v2-stress-test.js" },

@@ -2841,6 +2841,11 @@ class OfferItemEngineV2 {
     if (entry) {
       entry.traceId = traceId;
       entry.correlationId = event?.correlationId || previous?.correlationId || entry.correlationId || "";
+      // A healthy Stream counter-offer is P0. Do not make it wait for the
+      // wallet/own-state safety read; that read continues asynchronously.
+      // Recompute on every latest-wins decision so a REST/recovery decision
+      // cannot inherit realtime privilege from an older Stream event.
+      entry.realtimeP0 = this.triggerSource(event) === "STREAM" && rank === 0;
       entry.notBefore = Math.max(entry.notBefore || 0, retryAt);
       // A newer decision can only RAISE the priority of a pending SEND.
       const prevRank = previous && previous.target && Number.isFinite(previous.priorityRank) ? previous.priorityRank : 3;
@@ -3077,6 +3082,31 @@ class OfferItemEngineV2 {
     return true;
   }
 
+  /**
+   * Whether a warm, known-market P0 Stream counter may proceed while own
+   * history is being reconciled. This is deliberately narrower than disabling
+   * own-authority: COLD first-read and a row-local ambiguous POST still wait.
+   * The user's tolerance for duplicate own offers applies only to the former
+   * (unknown historical own orders), never to an unresolved POST outcome.
+   */
+  canRealtimeSendWithoutOwnAuthority(key, row, book, intent) {
+    if (!intent?.realtimeP0 || !row?.running || !book) return false;
+    if (this.awaitingFirstRead.has(key) && !(book.hydratedAt > 0 && book.effectiveBest(Date.now()).price > 0)) return false;
+    if (!this.topicReady(row, book)) return false;
+    if (!(book.effectiveBest(Date.now()).price > 0)) return false;
+    const authorityAt = Math.max(this.ownSyncAt || 0, book.ownReconciledAt || 0, book.ownKnownAt || 0);
+    if ((book.ownUnknownAt || 0) > authorityAt) return false;
+    return true;
+  }
+
+  scheduleOwnReconcileAfterRealtimePost(key, wasOwnStateBypassed) {
+    if (!wasOwnStateBypassed || this.ownAuthoritative(key)) return false;
+    // Recovery scheduling is best-effort and must never throw through the
+    // HTTP stage callback or interfere with the already-started POST.
+    try { return this.queueOwnResync("post-p0-own"); }
+    catch { return false; }
+  }
+
   /** Licence từ chối ngay trước khi ký: hàng dừng ở FAILED, log một lần mỗi lý do. */
   refuseForLicence(key, row, traceId, gate) {
     const why = `licence: ${(gate && gate.error) || "không hợp lệ"}`;
@@ -3147,7 +3177,10 @@ class OfferItemEngineV2 {
     // Own authority của RIÊNG hàng này — thuần cục bộ (xem ownAuthoritative).
     // Chỉ hàng lạnh chưa từng được soát, hoặc hàng vừa có POST mơ hồ, mới
     // phải chờ đối soát; không có kiểm mạng nào trên đường bình thường.
-    if (!this.ownAuthoritative(key)) {
+    const ownCoveredBeforeSend = this.ownAuthoritative(key);
+    const canUseRealtimeBeforeSend = !ownCoveredBeforeSend &&
+      this.canRealtimeSendWithoutOwnAuthority(key, row, this.book.get(key), first);
+    if (!ownCoveredBeforeSend && !canUseRealtimeBeforeSend) {
       this.deferForOwnSync(key, row, traceId);
       return;
     }
@@ -3155,7 +3188,7 @@ class OfferItemEngineV2 {
       const own = this.ownDiagnostic(key);
       productionTrace.record("own_state", { correlationId: first.correlationId || traceId }, {
         chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
-        status: "covered", target: first.target, ownAuthoritative: own.covered,
+        status: canUseRealtimeBeforeSend ? "unknown-allowed-p0" : "covered", target: first.target, ownAuthoritative: own.covered,
         ownSyncPending: own.ownSyncPending, ownSyncAt: own.ownSyncAt,
         ownReconciledAt: own.ownReconciledAt, ownKnownAt: own.ownKnownAt,
         ownUnknownAt: own.ownUnknownAt, ownReadOwned: false
@@ -3292,10 +3325,12 @@ class OfferItemEngineV2 {
     }
     const target = verdict.target;
     // Ghi target mới nhất vào ý định (latest-wins) rồi đi tiếp.
+    const priorLatestIntent = this.intents.get(key);
     const latestIntent = this.intents.set(key, {
       target, best: best.price, mine: mine.price,
       generation: book.generation, reason: verdict.reason, at: now
     });
+    latestIntent.realtimeP0 = Boolean(priorLatestIntent?.realtimeP0);
     latestIntent.traceId = traceId;
     if (Math.abs(Number(first.target) - Number(target)) >= 1e-12) {
       this.log(`[DECISION] #${row.tokenId} tới lượt: best=${best.price} mine=${mine.price} → target=${target} (lúc xếp hàng: ${first.target})`);
@@ -3412,7 +3447,10 @@ class OfferItemEngineV2 {
     //   <= Max, own cục bộ chưa dẫn, Best cục bộ chưa vượt target, và own
     //   authority cục bộ của hàng. Không REST, không resync, không /profile.
     const bookNow = this.book.get(key);
-    if (!bookNow || !this.ownAuthoritative(key)) {
+    const ownCoveredAtPost = bookNow && this.ownAuthoritative(key);
+    const realtimeMayBypassOwnAtPost = bookNow && !ownCoveredAtPost &&
+      this.canRealtimeSendWithoutOwnAuthority(key, row, bookNow, this.intents.get(key));
+    if (!bookNow || (!ownCoveredAtPost && !realtimeMayBypassOwnAtPost)) {
       this.deferForOwnSync(key, row, traceId);
       return;
     }
@@ -3497,10 +3535,16 @@ class OfferItemEngineV2 {
         body: this.adapter.offerBody(signed, row),
         onStage: stage => {
           M(stage);
-          if (stage === "http_started") productionTrace.record("http_start", { correlationId: first.correlationId || traceId }, {
-            chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
-            status: "POST", best: first.best, mine: first.mine, max: row.maxPrice, target
-          });
+          if (stage === "http_started") {
+            productionTrace.record("http_start", { correlationId: first.correlationId || traceId }, {
+              chain: this.chain, collection: row.collectionSlug, tokenId: row.tokenId,
+              status: "POST", best: first.best, mine: first.mine, max: row.maxPrice, target
+            });
+            // Start own reconciliation only AFTER the realtime POST has
+            // actually reached transport; never put REST even shortly ahead.
+            this.scheduleOwnReconcileAfterRealtimePost(key,
+              Boolean(canUseRealtimeBeforeSend || realtimeMayBypassOwnAtPost));
+          }
         }
       });
     } catch (error) {
