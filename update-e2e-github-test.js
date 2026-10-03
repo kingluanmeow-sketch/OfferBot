@@ -14,13 +14,13 @@
 // real GitHub Releases update FEED and the real downloaded ASSET BYTES --
 // that checkForUpdates() finds the right version/files and downloadUpdate()
 // fetches bytes whose size+SHA512 match the manifest. It does NOT simulate a
-// packaged v1.25.32/v1.25.33 install byte-for-byte: there is no actual old
+// packaged baseline install byte-for-byte: there is no actual old
 // packaged binary present in this sandbox to diff against, so differential
 // download is explicitly disabled (disableDifferentialDownload = true) and
 // only the full-download path runs. "BASELINE_VERSIONS" below only changes
 // what `currentVersion` the feed check reports as already-installed; it is
 // not a claim that this reproduces a packaged older installer's on-disk
-// state. Do not describe this as "simulates the packaged v1.25.32/33 app."
+// state. Do not describe this as "simulates a packaged older app."
 //
 // SAFETY, enforced, not assumed: every download path is tracked and force-
 // deleted before exit (own try/finally, independent of success/failure).
@@ -48,6 +48,15 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
+const { createRequire } = require("module");
+// Must be electron-updater's OWN semver copy, not the top-level one.
+// electron-updater ships a nested node_modules/semver, and its internal
+// `semver.eq(latest, this.currentVersion)` (AppUpdater.js:345) rejects a
+// SemVer instance built by a different copy with 'Invalid version. Must be
+// a string. Got type "object"'. Resolving through electron-updater's own
+// require means we get whichever copy it actually uses (nested, or the
+// deduped top-level one) -- exactly what its constructor parses with.
+const euSemver = createRequire(require.resolve("electron-updater"))("semver");
 
 const ROOT = __dirname;
 // PID-scoped so two runs (or a stale run) can never collide on the same
@@ -82,7 +91,7 @@ const pkg = require(path.join(ROOT, "package.json"));
 const TARGET_VERSION = pkg.version;
 // What `currentVersion` the feed check reports as already-installed. See
 // the SCOPE note above: this does not reproduce a packaged binary's bytes.
-const BASELINE_VERSIONS = ["1.25.32", "1.25.33"];
+const BASELINE_VERSIONS = ["1.25.61", "1.25.62"];
 
 const FORBIDDEN_CACHE_SUBSTRINGS = ["\\Electron\\pending", "/Electron/pending", "OpenSea Offer Bot", "opensea-offer-bot"];
 
@@ -173,7 +182,14 @@ async function runForBaseline(baselineVersion) {
   // the network instead of silently no-op'ing ("not packed and dev update
   // config is not forced").
   autoUpdater.forceDevUpdateConfig = true;
-  autoUpdater.currentVersion = baselineVersion;
+  // Must be a parsed SemVer object, NOT a raw string. Production never
+  // assigns this directly -- AppUpdater's constructor does
+  // `this.currentVersion = semver.parse(this.app.version)` (AppUpdater.js
+  // ~212-217). A raw string survives the update-IS-available path but
+  // throws "currentVersion.format is not a function" in the
+  // update-NOT-available branch (AppUpdater.js:405), which is exactly the
+  // branch a baseline equal to the published latest takes.
+  autoUpdater.currentVersion = euSemver.parse(baselineVersion);
   autoUpdater.setFeedURL({
     provider: "github",
     owner: pkg.build.publish[0].owner,
@@ -280,7 +296,7 @@ async function cleanupAndVerify() {
   await app.whenReady();
   log(`update-e2e-github-test.js starting -- target release=${TARGET_VERSION} baselines=${BASELINE_VERSIONS.join(",")} identity=${HARNESS_IDENTITY}`);
   log(`feed: github.com/${pkg.build.publish[0].owner}/${pkg.build.publish[0].repo} (releases/latest)`);
-  log("SCOPE: verifies real feed discovery + real downloaded asset bytes (size+SHA512). Does not diff against an actual packaged v1.25.32/33 binary -- none is present in this sandbox.");
+  log("SCOPE: verifies real feed discovery + real downloaded asset bytes (size+SHA512). Does not diff against an actual packaged baseline binary -- none is present in this sandbox.");
 
   try {
     for (const v of BASELINE_VERSIONS) {
