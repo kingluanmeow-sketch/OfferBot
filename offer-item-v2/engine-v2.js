@@ -2320,9 +2320,15 @@ class OfferItemEngineV2 {
    *   line itself is built in setImmediate. Bounded: 20 lines/s per engine,
    *   the rest counted into one summary line. Only tracked NFTs are logged.
    */
-  /** Thêm một row vào index pre_toBookOp -- O(1), gọi đúng 1 lần ở registerRow. */
+  /**
+   * Thêm một row vào index pre_toBookOp -- O(1). KHÔNG thêm entry cho slug
+   * rỗng (audit: trước đây `registerRow` gọi hàm này ngay cả khi
+   * `row.collectionSlug` còn rỗng -- NFT mới thêm/URL chưa giải slug tạo
+   * một entry vô dụng dưới key "", không bao giờ dọn vì slug thật resolve
+   * sau KHÔNG đi qua đây -- xem `setRowCollectionSlug`).
+   */
   addToPreToBookOpIndex(row) {
-    if (!row) return;
+    if (!row || !row.collectionSlug) return;
     const slug = row.collectionSlug;
     let bucket = this.preToBookOpIndex.get(slug);
     if (!bucket) { bucket = { byCanon: new Map(), contracts: new Map() }; this.preToBookOpIndex.set(slug, bucket); }
@@ -2356,6 +2362,66 @@ class OfferItemEngineV2 {
       else bucket.contracts.set(row.contract, c - 1);
     }
     if (!bucket.byCanon.size && !bucket.contracts.size) this.preToBookOpIndex.delete(slug);
+  }
+
+  /**
+   * ĐƯỜNG DUY NHẤT thay `row.collectionSlug` SAU KHI đã `registerRow()` --
+   * cập nhật NGUYÊN TỬ mọi thứ phụ thuộc slug đó (audit, lỗi thật thấy
+   * trong source):
+   *
+   *   `ensureTemplate()` (nơi gọi) trước đây GÁN THẲNG `row.collectionSlug
+   *   = collection.slug` khi slug giải ra ở nền, không gỡ/thêm index nào.
+   *   Hậu quả KÉP:
+   *     1. `preToBookOpIndex` (diagnostic): entry cũ dưới slug rỗng/stale
+   *        không bao giờ được gỡ, entry mới dưới slug thật không bao giờ
+   *        được thêm -- NFT thêm trước khi có slug mất fallback mapping
+   *        diagnostic VĨNH VIỄN, dù slug sau đó giải đúng.
+   *     2. `book.bySlug`/`book.collectionSlug` (MemoryBook, dùng để fan-out
+   *        MỌI `collection_offer` tới đúng token) CŨNG không được đồng bộ
+   *        -- một NFT thêm chưa có slug KHÔNG BAO GIỜ nhận Collection Offer
+   *        của chính collection nó, TRÁI với chú thích ngay tại nơi gọi
+   *        ("Không ghi lại thì ... hàng vẫn vô hình với đường đọc Collection
+   *        Offer"). Đây không chỉ là lỗi diagnostic -- là lỗi THẬT ảnh
+   *        hưởng Decision/Best.
+   *
+   *   `book.add()` đã idempotent an toàn gọi lại (không thêm bySlug nếu
+   *   slug rỗng, tự nâng cấp khi slug từ rỗng → có giá trị) nên gọi lại nó
+   *   ở đây là đủ để đồng bộ MemoryBook. Trường hợp real→real khác nhau
+   *   (A→B) không xảy ra ở đường gọi hiện tại (`ensureTemplate` chỉ gán khi
+   *   `!row.collectionSlug`) nhưng hàm này xử lý đúng cho TỔNG QUÁT, phòng
+   *   mọi đường gọi tương lai: gỡ sạch slug CŨ (cả index diagnostic và
+   *   `book.bySlug`) trước khi thêm theo slug MỚI.
+   *
+   *   contract/tokenId của một row KHÔNG đổi sau khi tạo ở bất kỳ đường nào
+   *   trong engine này (xác nhận bằng source: `tokenKey()` -- khoá của
+   *   `this.rows`/`this.book.books` -- được tính từ contract+tokenId ngay
+   *   lúc `registerRow()`, và không có nơi nào gán lại `row.contract`/
+   *   `row.tokenId` sau đó; đổi contract/tokenId thực chất là một NFT khác,
+   *   đi qua `removeRow` + `registerRow` mới, không phải "sửa tại chỗ").
+   *   Chỉ `collectionSlug` có đường gán lại tại chỗ -- đây là lý do hàm
+   *   này chỉ cần xử lý đúng MỘT trường.
+   */
+  setRowCollectionSlug(row, rawSlug) {
+    if (!row) return;
+    const next = rawSlug ? String(rawSlug).toLowerCase() : "";
+    const prev = row.collectionSlug || "";
+    if (next === prev) return; // không đổi -- không re-add, không duplicate/refcount sai
+    if (prev) {
+      this.removeFromPreToBookOpIndex(row);
+      const oldSet = this.book.bySlug?.get(prev);
+      if (oldSet) {
+        oldSet.delete(row.key);
+        if (!oldSet.size) this.book.bySlug.delete(prev);
+      }
+    }
+    row.collectionSlug = next;
+    if (next) {
+      this.book.add({ key: row.key, chain: this.chain, contract: row.contract, tokenId: row.tokenId, collectionSlug: next });
+      this.addToPreToBookOpIndex(row);
+    } else {
+      const book = this.book.get(row.key);
+      if (book) book.collectionSlug = "";
+    }
   }
 
   /**
@@ -3966,7 +4032,7 @@ class OfferItemEngineV2 {
        *   không bao giờ nhận được Collection Offer của chính collection nó.
        */
       if (!row.collectionSlug && collection && collection.slug) {
-        row.collectionSlug = collection.slug;
+        this.setRowCollectionSlug(row, collection.slug);
         this.log(`#${row.tokenId} đã xác định collection: ${collection.slug}`);
       }
       this.applyTemplate(row, config, account, collection);
