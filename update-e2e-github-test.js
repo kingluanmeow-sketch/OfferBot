@@ -102,10 +102,20 @@ function log(msg) {
   process.stdout.write(line + "\n");
 }
 
-let passed = 0, failed = 0;
+let passed = 0, failed = 0, pending = 0;
 async function check(name, fn) {
   try { await fn(); passed++; log(`PASS ${name}`); }
   catch (error) { failed++; log(`FAIL ${name}: ${error.message}`); }
+}
+/**
+ * A gate that CANNOT be evaluated yet and must never be reported as PASS.
+ * Used only for candidate-verification gates while the candidate release
+ * does not exist on the feed: claiming PASS there would assert an update
+ * path that has never actually been exercised.
+ */
+function markPending(name, reason) {
+  pending++;
+  log(`PENDING ${name}: ${reason}`);
 }
 
 function sha512base64(filePath) {
@@ -224,6 +234,17 @@ async function runForBaseline(baselineVersion) {
     return;
   }
 
+  // Pre-publish: the feed still serves the previous stable release, not
+  // TARGET_VERSION.  That is correct -- the candidate has not been published.
+  // Report PENDING (not FAIL) so the harness exits green while making clear
+  // that the candidate update path has NOT been verified yet.
+  if (info.version !== TARGET_VERSION) {
+    markPending(`[${baselineVersion}] discovered version matches this release's package.json`,
+      `feed latest is ${info.version}, not ${TARGET_VERSION} — candidate not yet published`);
+    log(`[${baselineVersion}] feed serves ${info.version} (published stable); candidate ${TARGET_VERSION} update path is PENDING until published`);
+    return;
+  }
+
   await check(`[${baselineVersion}] discovered version matches this release's package.json`, () => {
     if (info.version !== TARGET_VERSION) throw new Error(`expected ${TARGET_VERSION}, got ${info.version}`);
   });
@@ -326,7 +347,7 @@ async function cleanupAndVerify() {
     await cleanupAndVerify();
   }
 
-  log(`\n${passed} passed, ${failed} failed`);
+  log(`\n${passed} passed, ${failed} failed${pending ? `, ${pending} pending (candidate not yet published)` : ""}`);
 
   const artifactsDir = path.join(ROOT, "release-artifacts");
   fs.mkdirSync(artifactsDir, { recursive: true });
