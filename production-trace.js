@@ -8,7 +8,7 @@ const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_QUEUE = 20000;
 const MAX_BATCH = 256;
 const EVENTS = new Set(["item_received_bid", "collection_offer", "trait_offer", "item_cancelled", "order_invalidate", "order_revalidate"]);
-const STAGES = new Set(["stream_raw", "stream_rx", "stream_mapped", "book_update", "decision", "intent", "blocked", "own_state", "own_update", "send_queued", "http_start", "submit_success", "submit_failure", "rest_request", "rest_response", "bootstrap"]);
+const STAGES = new Set(["pre_toBookOp", "stream_rx", "stream_mapped", "book_update", "decision", "intent", "blocked", "own_state", "own_update", "send_queued", "http_start", "submit_success", "submit_failure", "rest_request", "rest_response", "bootstrap"]);
 const REASONS = new Set(["SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "topic-not-ready", "shadow-authority-required", "low-balance", "first-read", "template", "own-state-unknown", "not-applied", "applied", "http", "stale-before-post", "quota", "build", "cancelled", "other",
   // "mapped nhưng không áp" -- phân loại chính xác lý do apply() từ chối (audit:
   // stream_rx ghi "mapped" mà book_update không bao giờ viết ra, không ai biết
@@ -29,10 +29,11 @@ const STATUSES = new Set(["mapped", "scope-event", "decode-failed", "applied", "
   // đã nhận order). Tách khỏi "SUCCESS" để không lẫn vào số liệu thành công
   // thật của ví đang chạy.
   "SUCCESS_DISCARDED_OLD_EPOCH",
-  // stream_raw (audit): raw Stream frame tới, TRƯỚC toBookOp() -- cho phép so
-  // sánh với stream_rx (SAU normalize) để tách "OpenSea chưa từng gửi" khỏi
-  // "normalizer/tra byNft đã bỏ nó" khỏi "chỉ một feed nhận được".
-  "received"]);
+  // pre_toBookOp (audit sửa lần 2): event đã qua SDK, TRƯỚC toBookOp() --
+  // "mapped" (tái dùng status có sẵn) nếu tra byNft ra, "unmapped" nếu
+  // KHÔNG -- CHÍNH "unmapped" là bằng chứng normalizer/lookup đã bỏ event
+  // dù collection vẫn đang theo dõi (độc lập với byNft lúc quyết định ghi).
+  "unmapped"]);
 // Which independent Stream connection delivered this event (1.25.40 dual-feed
 // redundancy). Lets a production trace distinguish "feed A never got this"
 // from "feed A got it, feed B also got it" from raw stream_rx rows alone.
