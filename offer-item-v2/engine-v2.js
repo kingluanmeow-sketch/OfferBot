@@ -1890,6 +1890,32 @@ class OfferItemEngineV2 {
 
   apply(event) {
     const receivedAt = Date.now();
+    /**
+     * CHỨNG CỨ TRƯỚC NORMALIZER (audit: Apu #5518/#7309 -- orderHash của order
+     * ngoài đang dẫn giá không xuất hiện MỘT LẦN nào, kể cả ở `stream_rx`)
+     *
+     *   `stream_rx` (dưới) chỉ ghi SAU `toBookOp()` -- nếu normalizer trả về
+     *   null (giá/ε criteria không dùng được, v.v.) hoặc tra `byNft` không ra
+     *   (contract/tokenId không khớp định dạng đã đăng ký), KHÔNG CÓ GÌ được
+     *   ghi, giống hệt như khi OpenSea chưa từng gửi event đó. Hai trường hợp
+     *   này KHÔNG THỂ phân biệt được từ `stream_rx` một mình.
+     *
+     *   Ghi RIÊNG, từ RAW `event.nft` (trước toBookOp), bounded giống đúng lý
+     *   do `stream_rx` đã bounded (chỉ NFT đang theo dõi, qua `byNft`) -- để
+     *   sau này so `stream_raw` (event tới, trước normalize) với `stream_rx`
+     *   (sau normalize, đã map ra token) mà tách ba trường hợp:
+     *     1. `stream_raw` không hề có cho orderHash đó, ở CẢ HAI feed →
+     *        OpenSea/WS chưa từng gửi (không có cách xác nhận thêm nếu không
+     *        bắt packet transport-level -- KHÔNG suy đoán xa hơn).
+     *     2. `stream_raw` có nhưng `stream_rx` theo sau không có → normalizer
+     *        (`toBookOp`) hoặc tra `byNft` đã bỏ nó.
+     *     3. `stream_raw` có ở MỘT feed mà không có ở feed kia (cùng
+     *        orderHash) → bất đồng hai feed, bằng chứng transport-level thật.
+     *
+     *   CHỈ là chẩn đoán (đọc-chỉ, không ảnh hưởng apply/evaluate/POST nào) --
+     *   KHÔNG phải cơ chế recovery. Không trigger REST, không sweep.
+     */
+    this.recordRawStreamEvidence(event);
     const op = toBookOp(event);
     if (!op) return;
     event.mappedMono = mono();
@@ -2227,6 +2253,23 @@ class OfferItemEngineV2 {
    *   line itself is built in setImmediate. Bounded: 20 lines/s per engine,
    *   the rest counted into one summary line. Only tracked NFTs are logged.
    */
+  /**
+   * Chẩn đoán bounded, trước normalizer -- xem ghi chú ở nơi gọi (`apply()`).
+   * Chỉ ghi cho NFT đang theo dõi (tra `byNft` trực tiếp từ raw event, không
+   * qua `toBookOp`), đúng giới hạn I/O mà `stream_rx` đã dùng.
+   */
+  recordRawStreamEvidence(event) {
+    const contract = event?.nft?.contract ? String(event.nft.contract).toLowerCase() : "";
+    const tokenId = event?.nft?.tokenId ? String(event.nft.tokenId) : "";
+    if (!contract || !tokenId) return;
+    const key = this.book.byNft?.get(`${contract}:${tokenId}`);
+    if (!key) return;
+    productionTrace.record("stream_raw", event, {
+      chain: this.chain, collection: event.collectionSlug || "", tokenId,
+      status: "received", orderHash: event.orderHash || "", feed: event.feed || ""
+    });
+  }
+
   streamDiag(op, touched, note = "") {
     const now = Date.now();
     if (now - (this.diagWindowAt || 0) >= 1000) {
