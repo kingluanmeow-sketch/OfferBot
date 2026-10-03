@@ -178,6 +178,10 @@ const BALANCE_RESULT_FRESH_MS = 10 * 1000;
 
 /** Mỗi token tối đa một lượt hỏi phạm vi trait trong quãng này. */
 const TRAIT_PROBE_COOLDOWN_MS = 60 * 1000;
+/** NPC #6490 (audit): bao nhiêu "stale" liên tiếp không một lần áp được mới đáng nghi. */
+const STALE_STREAK_THRESHOLD = 15;
+/** Cooldown RIÊNG cho lượt đọc stale-streak -- không chia sẻ với trait-scope/book-contradiction. */
+const STALE_STREAK_COOLDOWN_MS = 60 * 1000;
 /** Và tối đa bấy nhiêu token cho MỘT sự kiện trait offer. */
 const TRAIT_PROBE_MAX_PER_EVENT = 8;
 /**
@@ -495,6 +499,14 @@ class OfferItemEngineV2 {
      * tiêu thụ đúng MỘT lần khi lượt trait-scope hiện tại settle/bỏ cuộc.
      */
     this.pendingContradiction = new Set();
+    /**
+     * NPC #6490: tokenKey -> số "stale" liên tiếp chưa có lần "applied" nào
+     * chen vào (xem STALE_STREAK_THRESHOLD, nơi dùng ở `apply()`). Xoá ngay
+     * khi key đó áp được MỘT op bất kỳ (Stream vẫn "nói chuyện" được).
+     */
+    this.staleStreakCount = new Map();
+    /** tokenKey -> lần cuối thực sự xin lượt đọc stale-streak-reconcile. */
+    this.staleStreakProbedAt = new Map();
 
     /**
      * pre_toBookOp: dedupe CÙNG feed (xem PRE_TOBOOKOP_DEDUPE_MS), trần cứng
@@ -1715,6 +1727,8 @@ class OfferItemEngineV2 {
     if (tsr && tsr.timer) clearTimeout(tsr.timer);
     this.traitScopeRetry.delete(key);
     this.pendingContradiction.delete(key);
+    this.staleStreakCount.delete(key);
+    this.staleStreakProbedAt.delete(key);
     const ts = this.templateState.get(key);
     if (ts && ts.timer) clearTimeout(ts.timer);
     this.templateState.delete(key);
@@ -2018,6 +2032,10 @@ class OfferItemEngineV2 {
       tokenId: op.tokenId, orderHash: op.orderHash || "", status: "mapped", feed: event.feed || ""
     });
     const touched = this.book.apply(op, receivedAt);
+    // NPC #6490 (audit): bất kỳ op THỰC SỰ áp được cho một key là bằng chứng
+    // Stream vẫn "nói chuyện" được với token đó -- xoá streak stale của CHÍNH
+    // key đó (xem nhánh "stale" trong vòng notApplied dưới đây).
+    for (const k of touched) this.staleStreakCount.delete(k);
     const trackedBookAfter = trackedNftKey ? this.book.get(trackedNftKey) : null;
     if (touched.length) productionTrace.record("book_update", event, {
       chain: this.chain, collection: op.collectionSlug || event.collectionSlug,
@@ -2120,6 +2138,52 @@ class OfferItemEngineV2 {
               this.traitProbedAt.set(key, receivedAt);
               this.stats.bookContradictionProbes = (this.stats.bookContradictionProbes || 0) + 1;
               this.queueRead(row, { reason: "trait-scope", authoritative: true, readAt: receivedAt, firstRead: false, attempt: 1 });
+            }
+          } else {
+            /**
+             * STUCK STREAK: NHIỀU "STALE" LIÊN TIẾP MÀ KHÔNG MỘT LẦN NÀO ÁP
+             * ĐƯỢC (audit, NPC #6490 -- OpenSea Best 0.0115/Mine 0.0113, sổ
+             * cục bộ kẹt ở 0.0109/ON_TOP suốt hàng chục sự kiện)
+             *
+             *   Mâu thuẫn ở trên (`op.price > current`) chỉ bắt được khi
+             *   CHÍNH op bị từ chối mang giá CAO HƠN sổ -- nhưng trace thật
+             *   của #6490 cho thấy 29/29 (93/93 toàn collection) sự kiện
+             *   "stale" bị từ chối đều có giá THẤP HƠN sổ (0 - 0.0043, out-
+             *   of-order create/cancel đua nhau hợp lệ trên một collection
+             *   bận) -- benign đúng nghĩa, KHÔNG mâu thuẫn theo luật trên.
+             *   Nhưng CHÍNH authority ngoài (OpenSea) đã có giá 0.0115 mà
+             *   order tạo ra nó KHÔNG hề để lại dấu vết ở CẢ HAI feed (cùng
+             *   loại điểm mù Apu #5518/#7309) -- sổ không có cách nào biết,
+             *   vì không event nào nó NHẬN ĐƯỢC mâu thuẫn với nó.
+             *
+             *   Bằng chứng duy nhất còn lại: một streak DÀI, LIÊN TỤC toàn
+             *   "stale" mà không một lần "applied" nào chen vào -- bất
+             *   thường so với vận hành bình thường (hầu hết token vẫn áp
+             *   được định kỳ). Đến ngưỡng (STALE_STREAK_THRESHOLD), xin
+             *   ĐÚNG MỘT lượt đọc authoritative cho CHÍNH token đó -- cooldown
+             *   RIÊNG (không chia sẻ với trait-scope/book-contradiction, để
+             *   không mất bằng chứng của mâu thuẫn CÓ giá cụ thể), reset
+             *   streak ngay khi bắn để không bắn lại cho tới cooldown kế
+             *   tiếp. KHÔNG polling (chỉ đếm theo SỰ KIỆN THẬT tới, không
+             *   timer), KHÔNG sweep (chỉ đúng token này), tái dùng nguyên
+             *   `queueRead`/single-flight/generation-safety đã có.
+             */
+            const streak = (this.staleStreakCount.get(key) || 0) + 1;
+            if (streak >= STALE_STREAK_THRESHOLD) {
+              const lastProbe = this.staleStreakProbedAt.get(key) || 0;
+              if (receivedAt - lastProbe >= STALE_STREAK_COOLDOWN_MS) {
+                this.staleStreakProbedAt.set(key, receivedAt);
+                this.staleStreakCount.set(key, 0);
+                this.stats.staleStreakProbes = (this.stats.staleStreakProbes || 0) + 1;
+                if (row && row.running && typeof this.adapter.fetchBest === "function") {
+                  this.queueRead(row, { reason: "stale-streak-reconcile", authoritative: true, readAt: receivedAt, firstRead: false, attempt: 1 });
+                }
+              } else {
+                // Đang cooldown: không bắn lại, nhưng chặn streak phình vô hạn.
+                this.staleStreakCount.set(key, STALE_STREAK_THRESHOLD);
+              }
+            } else {
+              this.staleStreakCount.set(key, streak);
             }
           }
         }
