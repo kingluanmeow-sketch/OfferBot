@@ -16,9 +16,10 @@
  *   → xin giấy phép ghi
  *   → POST
  *
- *   Không REST. Không polling. Không debounce. Không tick scheduler. Không
- *   thời gian chờ cố định. Nếu sự kiện cộng trạng thái trong bộ nhớ đã đủ để
- *   biết nên gửi giá nào, thì giá đó có NGAY trong cùng một lượt gọi.
+ *   Critical path: không REST, không polling, không debounce, không tick
+ *   scheduler. Nếu sự kiện cộng trạng thái trong bộ nhớ đã đủ để biết nên gửi
+ *   giá nào, thì giá đó có NGAY trong cùng một lượt gọi. Event cursor P3 chạy
+ *   riêng ở safety plane; nó không nằm trước hoặc giữ capacity của đường này.
  *
  * SUBSCRIBE TRƯỚC, HYDRATE SAU
  *
@@ -48,6 +49,7 @@ const submitterModule = require("./submitter");
 const { readPostedOrder, retryAfterMs } = submitterModule;
 const { RecoveryPlane } = require("./recovery-plane");
 const { TraitSnapshot } = require("./trait-snapshot");
+const { EventCursor, tokenIdentity, eventType } = require("./event-backfill");
 // Dùng CHÍNH bộ nhận diện mà phần còn lại của app dùng. Một danh sách mẫu câu
 // thứ hai sẽ trôi khỏi cái thứ nhất, và lúc đó hai nửa sản phẩm bất đồng về
 // việc ví có đủ tiền hay không.
@@ -259,6 +261,8 @@ const PRE_TOBOOKOP_FEED_SHARE = 0.75;
 const PRE_TOBOOKOP_DEDUPE_MS = 500;
 /** Trần cứng cho map dedupe -- không phụ thuộc lịch dọn, tự rút gọn khi đầy. */
 const PRE_TOBOOKOP_DEDUPE_MAX = 500;
+/** Bounded low-priority Events cursor cadence; P0/P1 and API broker remain authoritative. */
+const EVENT_BACKFILL_TICK_MS = 250;
 /**
  * Quy về dạng chuẩn để so hai tokenId viết khác kiểu (số thập phân có số 0
  * đứng đầu, hex) nhưng CÙNG giá trị. Trả "" khi không quy đổi được (garbage
@@ -400,6 +404,11 @@ class OfferItemEngineV2 {
       pressure: () => this.realtimePressure()
     });
     this.http = new submitterModule.HttpPool({ maxSockets: 8 });
+    this.eventCursor = new EventCursor();
+    this.eventBackfillTimer = null;
+    this.eventBackfillBusy = false;
+    this.eventBackfillEpoch = 0;
+    this.eventBackfillCursor = 0;
 
     /** Đặt lúc Start, khi đã có Private Key. */
     this.builder = null;
@@ -6315,6 +6324,7 @@ class OfferItemEngineV2 {
     if (this.retryTimer.unref) this.retryTimer.unref();
     this.watchdogTimer = setInterval(() => { try { this.watchdog(); } catch (e) { this.log(`watchdog lỗi: ${e.message}`); } }, WATCHDOG_MS);
     if (this.watchdogTimer.unref) this.watchdogTimer.unref();
+    this.startEventBackfill();
   }
 
   stopLoops() {
@@ -6322,9 +6332,116 @@ class OfferItemEngineV2 {
     if (this.watchdogTimer) clearInterval(this.watchdogTimer);
     this.retryTimer = null;
     this.watchdogTimer = null;
+    this.stopEventBackfill();
     this.cancelBalanceTimer();
     this.balanceProbeFailures = 0;
     this.balanceProbeInFlightAt = 0;
+  }
+
+  /** Incremental, P3-only recovery for OpenSea Stream's documented best-effort
+   * delivery. It reads collection Events cursors (not periodic /best sweeps),
+   * then queues exact-token or collection-scoped recovery only when an offer
+   * event is actually observed. */
+  startEventBackfill() {
+    this.stopEventBackfill();
+    if (typeof opensea.fetchCollectionEvents !== "function") return;
+    this.eventBackfillEpoch++;
+    this.eventBackfillBusy = false;
+    const epoch = this.eventBackfillEpoch;
+    const tick = () => {
+      this.eventBackfillTimer = null;
+      if (epoch !== this.eventBackfillEpoch || this.state !== STATE.RUNNING || this.eventBackfillBusy) return;
+      const slugs = [...new Set([...this.rows.values()].filter(row => row.running && row.collectionSlug)
+        .map(row => String(row.collectionSlug).toLowerCase()))].sort();
+      this.eventCursor.prune(slugs);
+      if (!slugs.length) return this.scheduleEventBackfillTick(tick, epoch);
+      const index = this.eventBackfillCursor++ % slugs.length;
+      const slug = slugs[index];
+      const cursor = this.eventCursor.request(slug);
+      this.eventBackfillBusy = true;
+      const release = () => { if (epoch === this.eventBackfillEpoch) this.eventBackfillBusy = false; };
+      const queued = this.recovery.push({
+        kind: "collection-event-backfill", priority: 3,
+        run: async ({ signal }) => {
+          try { return await opensea.fetchCollectionEvents(slug, { ...cursor, signal, priority: PRIORITY.P2 }); }
+          catch (error) { return { failed: true, reason: String(error?.message || error).slice(0, 120) }; }
+        },
+        onDrop: release,
+        onResult: page => {
+          if (epoch !== this.eventBackfillEpoch || this.state !== STATE.RUNNING) return;
+          let delay = EVENT_BACKFILL_TICK_MS;
+          try {
+            if (!page || page.failed) {
+              delay = 2000;
+              throw new Error(page?.reason || "no-response");
+            }
+            const events = this.eventCursor.accept(slug, page);
+            this.stats.eventBackfillPages = (this.stats.eventBackfillPages || 0) + 1;
+            this.stats.eventBackfillEvents = (this.stats.eventBackfillEvents || 0) + events.length;
+            for (const event of events) this.applyBackfilledOfferEvent(slug, event);
+          } catch (error) {
+            this.stats.eventBackfillFailures = (this.stats.eventBackfillFailures || 0) + 1;
+            const now = Date.now();
+            if (now - (this.eventBackfillLastErrorAt || 0) > 30000) {
+              this.eventBackfillLastErrorAt = now;
+              this.log(`Events recovery ${slug} lỗi (${String(error?.message || error).slice(0, 120)}); sẽ thử lại nền`);
+            }
+          } finally {
+            release();
+            this.scheduleEventBackfillTick(tick, epoch, delay);
+          }
+        }
+      });
+      if (!queued) {
+        release();
+        this.scheduleEventBackfillTick(tick, epoch, 2000);
+      } else this.scheduleEventBackfillTick(tick, epoch);
+    };
+    // Let startup P1 authority reads enter RecoveryPlane first; P3 must never
+    // take their first read slot just because the loop was started earlier.
+    this.scheduleEventBackfillTick(tick, epoch, 1000);
+  }
+
+  scheduleEventBackfillTick(tick, epoch, delay = EVENT_BACKFILL_TICK_MS) {
+    if (this.eventBackfillTimer) clearTimeout(this.eventBackfillTimer);
+    this.eventBackfillTimer = setTimeout(() => {
+      this.eventBackfillTimer = null;
+      if (epoch === this.eventBackfillEpoch) tick();
+    }, delay);
+    this.eventBackfillTimer.unref?.();
+  }
+
+  stopEventBackfill() {
+    this.eventBackfillEpoch++;
+    if (this.eventBackfillTimer) clearTimeout(this.eventBackfillTimer);
+    this.eventBackfillTimer = null;
+    this.eventBackfillBusy = false;
+  }
+
+  applyBackfilledOfferEvent(slug, event) {
+    if (!event || this.state !== STATE.RUNNING) return 0;
+    const eventChain = String(event.chain || "").toLowerCase();
+    if (eventChain && eventChain !== String(this.chain).toLowerCase()) return 0;
+    const type = eventType(event);
+    const receivedAt = Date.now();
+    if (type === "collection_offer" || type === "trait_offer") {
+      const queued = this.queueCollectionSeed(slug, "event-backfill", { force: true });
+      if (queued) this.stats.eventBackfillCollectionRecoveries = (this.stats.eventBackfillCollectionRecoveries || 0) + 1;
+      return queued ? 1 : 0;
+    }
+    const identity = tokenIdentity(event);
+    if (!identity) return 0;
+    const rows = [...this.rows.values()].filter(row => row.running &&
+      String(row.collectionSlug || "").toLowerCase() === String(slug).toLowerCase() &&
+      String(row.contract || "").toLowerCase() === identity.contract &&
+      String(row.tokenId) === identity.tokenId);
+    let queued = 0;
+    for (const row of rows) {
+      if (this.queueRead(row, { reason: "event-backfill", authoritative: true,
+        readAt: receivedAt, firstRead: false, attempt: 1 })) queued++;
+    }
+    if (queued) this.stats.eventBackfillItemRecoveries = (this.stats.eventBackfillItemRecoveries || 0) + queued;
+    return queued;
   }
 
   /** Xem `expiryTimer` ở constructor. */

@@ -385,6 +385,7 @@ async function requestOnce(options) {
     method = "get",
     url,
     params,
+    paramsSerializer,
     data,
     kind = KIND.READ,
     priority = PRIORITY.P0,
@@ -458,6 +459,7 @@ async function requestOnce(options) {
         method,
         url,
         params,
+        paramsSerializer,
         data,
         headers: getApiHeaders(key),
         timeout,
@@ -1705,6 +1707,37 @@ async function fetchCollectionOffers(slug, { useCache = true, priority = PRIORIT
     out.reason = String((error && error.message) || error).slice(0, 120);
     return out;
   }
+}
+
+/**
+ * Read one incremental page of collection events. This is a safety-plane
+ * cursor read for Stream's documented best-effort gaps, not a Best sweep.
+ */
+async function fetchCollectionEvents(slug, { after, next, limit = 200, signal = null,
+  priority = PRIORITY.P2 } = {}) {
+  const key = String(slug || "").trim();
+  if (!key) return { events: [], next: null };
+  const params = { limit: Math.max(1, Math.min(200, Number(limit) || 200)),
+    event_type: ["offer", "trait_offer", "collection_offer"] };
+  if (next) params.next = String(next);
+  else if (Number.isFinite(Number(after)) && Number(after) > 0) params.after = Math.floor(Number(after));
+  const response = await apiGet(`/events/collection/${encodeURIComponent(key)}`, {
+    params,
+    paramsSerializer: { serialize(values) {
+      const query = new URLSearchParams();
+      for (const [name, value] of Object.entries(values || {})) {
+        for (const item of Array.isArray(value) ? value : [value]) {
+          if (item !== undefined && item !== null && item !== "") query.append(name, String(item));
+        }
+      }
+      return query.toString();
+    } },
+    signal, priority, label: "collection-events-backfill"
+  });
+  const data = response?.data || {};
+  const events = Array.isArray(data.asset_events) ? data.asset_events
+    : Array.isArray(data.events) ? data.events : [];
+  return { events, next: typeof data.next === "string" && data.next ? data.next : null };
 }
 
 /**
@@ -2977,6 +3010,7 @@ module.exports = {
   fetchCollectionFees,
   fetchBestOffer,
   fetchCollectionOffers,
+  fetchCollectionEvents,
   criteriaCoversToken,
   fetchMyOffers,
   fetchNftDetails,

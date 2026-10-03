@@ -31,6 +31,7 @@ const suites = [
   { file: "read-quota-test.js" },
   { file: "read-dispatcher-test.js" },
   { file: "write-quota-test.js" },
+  { file: "event-backfill-test.js" },
   { file: "read-capacity-test.js" },
   { file: "quota-broker-test.js" },
   { file: "production-trace-test.js" },

@@ -95,15 +95,19 @@ const START_BURST = 3;
 const RATE_FLOOR = 0.25;
 const RATE_CEILING = 8;
 const RECOVER_EVERY_MS = 3000;
-/** Order-posting ceilings at 80% of the dashboard (Key 1 2/s, Key 2 1/s). */
-// Start at the dashboard rate (Key 1 2/s, Key 2 1/s); soft ceilings far above
-// it so upgraded keys are used; AIMD (429 halves) finds the real limit.
-// Owner 2026-09-30 (final): dashboard ceilings at 90%, keys not added.
-const WRITE_CAPS = [2 * 0.9, 1 * 0.9];
-const WRITE_START = [2 * 0.9, 1 * 0.9];
-// 1.25.32: the two keys are two DIFFERENT OpenSea accounts (owner-confirmed):
-// independent pools, aggregate 1.8 + 0.9 = 2.7/s. Burst 1 per key so no
-// one-second window exceeds a dashboard rate (Key 1 2/s, Key 2 1/s).
+/**
+ * Adaptive per-account write probe. Start at the observed account limits, but
+ * remove the old 90%-of-dashboard ceiling: with sustained demand and clean
+ * responses, AIMD may probe up to 4x. A 429 halves only that account's rate
+ * and the broker honors Retry-After / X-RateLimit reset. This is bounded
+ * probing, not unlimited fan-out. OpenSea documents that keys under ONE
+ * account share quota, so separate domains are valid only for separate
+ * accounts (the two configured production keys were owner-confirmed as
+ * separate accounts).
+ */
+const WRITE_START = [2, 1];
+const WRITE_CAPS = WRITE_START.map(rate => rate * 4);
+// One token initial burst; do not spend a full window of writes at once.
 const WRITE_BURSTS = [1, 1];
 const GRANT_WINDOW_MS = 60000;
 
@@ -234,7 +238,7 @@ class QuotaModel {
    * KHÔNG phải bằng chứng về hạn mức nên không phạt. 2xx: sau ≥5 phản hồi tốt
    * và ≥3s kể từ lần chỉnh trước → rate ×1.25 (hồi nhanh, có trần).
    */
-  observe({ status = 0, latencyMs = 0 } = {}, mono = QuotaModel.mono()) {
+  observe({ status = 0, latencyMs = 0, underLoad = true } = {}, mono = QuotaModel.mono()) {
     const latency = Number(latencyMs) || 0;
     if (latency > 0) {
       this.latencyEwmaMs = this.latencyEwmaMs
@@ -250,7 +254,7 @@ class QuotaModel {
     }
     if (status >= 200 && status < 300) {
       this.goodResponses++;
-      if (this.rate < this.startRps * 4 && this.goodResponses >= 5 &&
+      if (underLoad && this.rate < this.startRps * 4 && this.goodResponses >= 5 &&
           mono - this.lastAdjustMono >= RECOVER_EVERY_MS) {
         this.rate = Math.min(this.rateCeiling, this.rate * 1.25);
         this.goodResponses = 0;
@@ -841,7 +845,8 @@ class QuotaBroker extends EventEmitter {
       model.penalize(msg.retryAfterMs);
       this.log(`429 → chặn domain ${msg.domain || "default"} ${msg.retryAfterMs}ms cho mọi tiến trình`);
     } else {
-      model.observe({ status: Number(msg.status) || 0, latencyMs: Number(msg.latencyMs) || 0 });
+      model.observe({ status: Number(msg.status) || 0,
+        latencyMs: Number(msg.latencyMs) || 0, underLoad: this.queue.size() > 0 });
     }
   }
 
