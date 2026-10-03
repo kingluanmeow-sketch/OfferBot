@@ -29,11 +29,14 @@ const STATUSES = new Set(["mapped", "scope-event", "decode-failed", "applied", "
   // đã nhận order). Tách khỏi "SUCCESS" để không lẫn vào số liệu thành công
   // thật của ví đang chạy.
   "SUCCESS_DISCARDED_OLD_EPOCH",
-  // pre_toBookOp (audit sửa lần 2): event đã qua SDK, TRƯỚC toBookOp() --
-  // "mapped" (tái dùng status có sẵn) nếu tra byNft ra, "unmapped" nếu
-  // KHÔNG -- CHÍNH "unmapped" là bằng chứng normalizer/lookup đã bỏ event
-  // dù collection vẫn đang theo dõi (độc lập với byNft lúc quyết định ghi).
-  "unmapped"]);
+  // pre_toBookOp (audit sửa lần 3): event đã qua SDK, TRƯỚC toBookOp() --
+  // "mapped" (tái dùng status có sẵn) nếu tra byNft ra đúng; ba trạng thái
+  // riêng khi KHÔNG, nhưng token đã khớp một row đang theo dõi của CHÍNH
+  // slug đó sau quy chuẩn (xem matchTrackedNft() trong engine-v2.js):
+  // "unmapped-contract" (đúng token, sai contract), "unmapped-token" (đúng
+  // contract+token nhưng cách viết tokenId gốc khác bản đã lưu),
+  // "unmapped-format" (tokenId không quy chuẩn được, chỉ contract khớp).
+  "unmapped-contract", "unmapped-token", "unmapped-format"]);
 // Which independent Stream connection delivered this event (1.25.40 dual-feed
 // redundancy). Lets a production trace distinguish "feed A never got this"
 // from "feed A got it, feed B also got it" from raw stream_rx rows alone.

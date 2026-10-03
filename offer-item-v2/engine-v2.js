@@ -249,6 +249,25 @@ const OWN_EXPIRY_TOLERANCE_S = 30;
 const GAP_READ_COOLDOWN_MS = 60 * 1000;
 /** Chẩn đoán pre_toBookOp: tối đa dòng/giây TOÀN ENGINE (không phải mỗi NFT). */
 const PRE_TOBOOKOP_RATE_LIMIT = 20;
+/** Không feed nào được chiếm quá tỉ lệ này của tổng quota/giây -- feed kia luôn còn sàn. */
+const PRE_TOBOOKOP_FEED_SHARE = 0.75;
+/** Dedupe CÙNG feed, CÙNG (orderHash,event,tokenId) trong khoảng này -- KHÔNG dedupe chéo feed (cần feed mask riêng để phát hiện bất đồng). */
+const PRE_TOBOOKOP_DEDUPE_MS = 500;
+/** Trần cứng cho map dedupe -- không phụ thuộc lịch dọn, tự rút gọn khi đầy. */
+const PRE_TOBOOKOP_DEDUPE_MAX = 500;
+/**
+ * Quy về dạng chuẩn để so hai tokenId viết khác kiểu (số thập phân có số 0
+ * đứng đầu, hex) nhưng CÙNG giá trị. Trả "" khi không quy đổi được (garbage
+ * thật, không phải lỗi định dạng số) -- gọi nơi dùng phải coi "" là "không
+ * so được", KHÔNG phải một giá trị hợp lệ để so khớp.
+ */
+function canonicalTokenId(raw) {
+  const s = String(raw == null ? "" : raw).trim();
+  if (!s) return "";
+  if (/^0x[0-9a-fA-F]+$/.test(s)) { try { return BigInt(s).toString(); } catch { return ""; } }
+  if (/^\d+$/.test(s)) { try { return BigInt(s).toString(); } catch { return s.replace(/^0+(?=\d)/, ""); } }
+  return "";
+}
 /**
  * BỘ ĐIỀU PHỐI KHÔNG TIẾN TRIỂN — ngưỡng cơ sở, cộng thêm cooldown hợp lệ của
  * broker (nhịp adaptive kế tiếp + Retry-After). Khi có
@@ -476,6 +495,13 @@ class OfferItemEngineV2 {
      * tiêu thụ đúng MỘT lần khi lượt trait-scope hiện tại settle/bỏ cuộc.
      */
     this.pendingContradiction = new Set();
+
+    /**
+     * pre_toBookOp: dedupe CÙNG feed (xem PRE_TOBOOKOP_DEDUPE_MS), trần cứng
+     * PRE_TOBOOKOP_DEDUPE_MAX (Map giữ thứ tự chèn -- rút mục cũ nhất khi
+     * đầy, không cần timer dọn riêng). Dọn hẳn ở reset()/shutdown().
+     */
+    this.preToBookOpDedupe = new Map();
 
     /**
      * NHỊP DỌN LỆNH HẾT HẠN — đồng hồ local, không cần mạng.
@@ -1529,7 +1555,9 @@ class OfferItemEngineV2 {
     // sang sau Reset.
     this.preToBookOpWindowAt = 0;
     this.preToBookOpCount = 0;
+    this.preToBookOpFeedCount = {};
     this.preToBookOpSuppressed = 0;
+    this.preToBookOpDedupe.clear();
     this.traits.retain([...this.rows.keys()]);
     this.balanceProbedAt = 0;
     this.balanceResultAt = 0;
@@ -1871,7 +1899,9 @@ class OfferItemEngineV2 {
     this.recovery.stop();
     this.preToBookOpWindowAt = 0;
     this.preToBookOpCount = 0;
+    this.preToBookOpFeedCount = {};
     this.preToBookOpSuppressed = 0;
+    this.preToBookOpDedupe.clear();
     this.http.destroy();
     this.state = STATE.STOPPED;
   }
@@ -2269,50 +2299,122 @@ class OfferItemEngineV2 {
    *   the rest counted into one summary line. Only tracked NFTs are logged.
    */
   /**
+   * Token của event này có thực sự thuộc một ROW đang theo dõi không, và vì
+   * sao tra trực tiếp (`byNft`) thất bại nếu có -- xem ghi chú ở nơi gọi
+   * (sửa lần 3, audit).
+   *
+   *   KHÔNG dùng "cùng collectionSlug" làm bằng chứng đủ: một collection có
+   *   thể có hàng nghìn token, tool chỉ theo dõi vài cái. Phải khớp ĐÚNG
+   *   token: tra thẳng (`byNft`) trước; thất bại thì chỉ xét những row THẬT
+   *   đang theo dõi của CHÍNH slug này (`book.bySlug`), so tokenId sau khi
+   *   quy chuẩn (`canonicalTokenId` -- số có số 0 đứng đầu, hex vs decimal).
+   *   Không khớp token nào ⇒ trả null, KHÔNG ghi gì (đây là token khác,
+   *   không liên quan, dù cùng collection).
+   */
+  matchTrackedNft(slug, rawContract, rawTokenId) {
+    if (rawContract && rawTokenId) {
+      const exact = this.book.byNft?.get(`${rawContract}:${rawTokenId}`);
+      if (exact) return "mapped";
+    }
+    const keys = this.book.bySlug?.get(slug);
+    if (!keys || !keys.size) return null;
+    const canon = canonicalTokenId(rawTokenId);
+    if (canon) {
+      for (const k of keys) {
+        const b = this.book.get(k);
+        if (b && canonicalTokenId(b.tokenId) === canon) {
+          // Đúng token (sau quy chuẩn) -- lệch nằm ở contract hay chỉ ở
+          // CÁCH VIẾT tokenId (đã quy chuẩn khớp nhưng chuỗi gốc khác).
+          return b.contract === rawContract ? "unmapped-token" : "unmapped-contract";
+        }
+      }
+      return null; // tokenId quy chuẩn không khớp BẤT KỲ row nào của slug này -- token khác thật, không liên quan
+    }
+    // tokenId không quy chuẩn được (không phải số/hex hợp lệ) -- chỉ coi là
+    // "có thể liên quan" nếu contract TRÙNG MỘT row đang theo dõi của CHÍNH
+    // slug này (một lý do cụ thể, không chỉ vì cùng collection).
+    for (const k of keys) {
+      const b = this.book.get(k);
+      if (b && rawContract && b.contract === rawContract) return "unmapped-format";
+    }
+    return null;
+  }
+
+  /**
    * Chẩn đoán trước `toBookOp()` -- xem ghi chú đầy đủ ở nơi gọi (`apply()`).
+   * Sửa lần 3 sau audit (hai lỗi của lần 2):
    *
-   *   Điều kiện ghi là `event.collectionSlug` khớp MỘT collection đang theo
-   *   dõi qua `book.bySlug` (Map slug -> Set<tokenKey>, xây dựng ĐỘC LẬP với
-   *   `byNft` lúc `book.add()`) -- KHÔNG tra `byNft`/contract/tokenId để
-   *   quyết định ghi hay không. Nếu tra sau đó (để tính `status`) thất bại,
-   *   dòng vẫn được ghi với "unmapped" -- khác bản đầu, nơi chính việc tra
-   *   đó quyết định có ghi gì hay không, nên lỗi mapping tự xoá luôn bằng
-   *   chứng của chính nó.
+   *   1. GATE SAI PHẠM VI: lần 2 chỉ cần `event.collectionSlug` khớp một
+   *      collection đang theo dõi -- nghĩa là MỌI event của collection đó,
+   *      kể cả hàng nghìn token KHÔNG theo dõi, dùng chung quota 20/s với
+   *      đúng những NFT ta cần bằng chứng. Một event không liên quan có
+   *      thể làm bằng chứng của NFT thật sự theo dõi bị suppress. Sửa:
+   *      `matchTrackedNft()` (trên) phải trả một status cụ thể (không
+   *      null) mới được xét ghi -- event của token khác trong cùng
+   *      collection không bao giờ chạm tới rate limiter.
    *
-   *   RATE LIMIT THẬT (sửa lần 2 -- bản đầu chỉ có comment nói "20 dòng/s"
-   *   nhưng không có giới hạn nào, và `MAX_QUEUE` của production-trace.js
-   *   KHÔNG phải một rate limiter theo thời gian): tối đa
-   *   PRE_TOBOOKOP_RATE_LIMIT dòng/giây TOÀN ENGINE (không phải mỗi NFT) --
-   *   một cửa sổ 1s đo bằng `Date.now()`, không `setTimeout`/`setInterval`
-   *   nào tồn tại (không gì để dọn khi reset/stop ngoài vài con số, dọn ở
-   *   `reset()`). Vượt ngưỡng chỉ tăng một counter bounded; khi cửa sổ kế
-   *   tiếp mở, MỘT dòng summary (`this.log`, không qua productionTrace --
-   *   không cần field theo schema) báo số dòng đã bỏ qua trong cửa sổ cũ.
+   *   2. RATE LIMIT KHÔNG CÔNG BẰNG GIỮA HAI FEED: một limiter chung 20/s
+   *      để một feed lũ (ví dụ reconnect storm) chiếm hết, che mất feed
+   *      còn lại trong đúng cửa sổ cần so sánh disagreement. Sửa: quota
+   *      con mỗi feed trong CÙNG cửa sổ (PRE_TOBOOKOP_FEED_SHARE -- không
+   *      feed nào vượt quá tỉ lệ này của tổng), cộng dedupe CÙNG feed cho
+   *      (orderHash,event,tokenId) lặp lại trong PRE_TOBOOKOP_DEDUPE_MS
+   *      (SDK phát lại khi reconnect, không mang thông tin mới) -- dedupe
+   *      KHÔNG áp dụng chéo feed, vì đó chính là tín hiệu disagreement cần
+   *      giữ (hai dòng riêng, mỗi dòng một `feed`, cùng audit so sánh sau).
+   *
+   *   `this.stats.preToBookOpDiagnosticIncomplete` tăng MỖI LẦN một bằng
+   *   chứng của NFT ĐANG THEO DÕI (đã qua matchTrackedNft) bị suppress --
+   *   đây là counter "chẩn đoán KHÔNG đầy đủ": bất kỳ audit nào thấy biến
+   *   này > 0 trong cửa sổ liên quan TUYỆT ĐỐI không được diễn giải
+   *   "stream_rx/pre_toBookOp không có" thành "event không tới SDK" --
+   *   có thể chỉ là bị suppress bởi chính rate limiter này.
    */
   recordPreToBookOpEvidence(event) {
     const slug = event?.collectionSlug ? String(event.collectionSlug).toLowerCase() : "";
     if (!slug || !this.book.bySlug?.has(slug)) return;
+    const rawContract = event?.nft?.contract ? String(event.nft.contract).toLowerCase() : "";
+    const rawTokenId = event?.nft?.tokenId ? String(event.nft.tokenId) : "";
+    if (!rawTokenId) return; // event theo collection/trait, không nhắm một token cụ thể -- không phải phạm vi chẩn đoán này
+    const status = this.matchTrackedNft(slug, rawContract, rawTokenId);
+    if (!status) return; // token KHÁC trong cùng collection -- không liên quan, không chạm quota
 
+    const feed = event.feed === "A" || event.feed === "B" ? event.feed : "";
+    const orderHash = event.orderHash ? String(event.orderHash) : "";
     const now = Date.now();
+
+    // Dedupe CÙNG feed (không chéo feed -- xem ghi chú trên).
+    const dedupeKey = `${orderHash}|${event.event || ""}|${rawTokenId}|${feed}`;
+    const lastSeenAt = this.preToBookOpDedupe.get(dedupeKey);
+    if (lastSeenAt !== undefined && now - lastSeenAt < PRE_TOBOOKOP_DEDUPE_MS) return;
+    if (this.preToBookOpDedupe.size >= PRE_TOBOOKOP_DEDUPE_MAX) {
+      const oldestKey = this.preToBookOpDedupe.keys().next().value;
+      if (oldestKey !== undefined) this.preToBookOpDedupe.delete(oldestKey);
+    }
+    this.preToBookOpDedupe.set(dedupeKey, now);
+
     if (now - (this.preToBookOpWindowAt || 0) >= 1000) {
       if (this.preToBookOpSuppressed) {
-        this.log(`[PRE-TOBOOKOP] +${this.preToBookOpSuppressed} sự kiện không ghi chi tiết (giới hạn ${PRE_TOBOOKOP_RATE_LIMIT}/s)`);
+        this.log(`[PRE-TOBOOKOP] +${this.preToBookOpSuppressed} bằng chứng NFT theo dõi không ghi (giới hạn ${PRE_TOBOOKOP_RATE_LIMIT}/s) -- chẩn đoán KHÔNG đầy đủ cho cửa sổ này`);
       }
       this.preToBookOpWindowAt = now;
       this.preToBookOpCount = 0;
+      this.preToBookOpFeedCount = {};
       this.preToBookOpSuppressed = 0;
     }
-    if ((this.preToBookOpCount = (this.preToBookOpCount || 0) + 1) > PRE_TOBOOKOP_RATE_LIMIT) {
+    const feedKey = feed || "?";
+    const feedUsed = this.preToBookOpFeedCount[feedKey] || 0;
+    const feedCap = Math.ceil(PRE_TOBOOKOP_RATE_LIMIT * PRE_TOBOOKOP_FEED_SHARE);
+    if (this.preToBookOpCount >= PRE_TOBOOKOP_RATE_LIMIT || feedUsed >= feedCap) {
       this.preToBookOpSuppressed = (this.preToBookOpSuppressed || 0) + 1;
+      this.stats.preToBookOpDiagnosticIncomplete = (this.stats.preToBookOpDiagnosticIncomplete || 0) + 1;
       return;
     }
-
-    const contract = event?.nft?.contract ? String(event.nft.contract).toLowerCase() : "";
-    const tokenId = event?.nft?.tokenId ? String(event.nft.tokenId) : "";
-    const mappedKey = contract && tokenId ? this.book.byNft?.get(`${contract}:${tokenId}`) : null;
+    this.preToBookOpCount++;
+    this.preToBookOpFeedCount[feedKey] = feedUsed + 1;
     productionTrace.record("pre_toBookOp", event, {
-      chain: this.chain, collection: slug, tokenId: tokenId || "",
-      status: mappedKey ? "mapped" : "unmapped", orderHash: event.orderHash || "", feed: event.feed || ""
+      chain: this.chain, collection: slug, tokenId: rawTokenId,
+      status, orderHash, feed
     });
   }
 

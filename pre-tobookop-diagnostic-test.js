@@ -1,38 +1,26 @@
 "use strict";
 
 /**
- * RED/GREEN: bounded pre-`toBookOp()` diagnostic (audit, Apu #5518/#7309),
- * sửa lần 2 sau review.
+ * RED/GREEN: pre_toBookOp diagnostic, sửa lần 3 sau review.
  *
- * BẢN ĐẦU SAI: `recordRawStreamEvidence()` tra `book.byNft` TRƯỚC khi quyết
- * định có ghi gì không -- nên nếu CHÍNH việc map contract/tokenId sai
- * (binding bug, không phải Stream thật sự im lặng), bằng chứng cũng biến
- * mất giống `stream_rx`, không tách được "SDK đã giao event nhưng lookup
- * sai" khỏi "event không tới".
+ * HAI LỖI CỦA LẦN 2 (đã sửa ở đây):
  *
- * SỬA: điều kiện ghi là `event.collectionSlug` khớp một collection đang
- * theo dõi qua `book.bySlug` (ĐỘC LẬP với `byNft`/contract/tokenId). Việc
- * tra `byNft` chỉ quyết định GIÁ TRỊ `status` ("mapped"/"unmapped"), không
- * quyết định có ghi dòng đó hay không. Stage đổi tên `pre_toBookOp` (rõ
- * nghĩa: đã qua SDK, CHƯA qua `toBookOp` -- không phải raw WebSocket/packet
- * capture).
+ * 1. GATE SAI PHẠM VI: lần 2 ghi cho MỌI event của một collection đang theo
+ *    dõi, bất kể token. Một collection có thể có hàng nghìn token trong
+ *    khi tool chỉ theo dõi vài cái -- traffic của những token KHÔNG theo
+ *    dõi dùng chung quota 20/s với đúng NFT cần bằng chứng, nên khi có
+ *    suppressed > 0, "không thấy pre_toBookOp của orderHash X" KHÔNG còn
+ *    là bằng chứng "event không tới SDK" (có thể chỉ là bị một token khác
+ *    cùng collection chiếm hết quota). Sửa: `matchTrackedNft()` phải khớp
+ *    ĐÚNG TOKEN (tra thẳng, hoặc so sánh tokenId quy chuẩn với CHÍNH các
+ *    row đang theo dõi của slug đó) trước khi event được coi là liên quan
+ *    và chạm tới rate limiter.
  *
- * BẢN ĐẦU CŨNG SAI Ở RATE LIMIT: comment nói "20 dòng/s" nhưng không có
- * limiter THẬT nào -- `productionTrace.record()` được gọi cho MỌI event
- * tracked, và `MAX_QUEUE` (production-trace.js) chỉ là trần kích thước
- * hàng đợi ghi file, không phải rate limiter theo thời gian. Dual-feed có
- * thể nhân đôi I/O trên hot path khi một collection bận. SỬA: cửa sổ 1s đo
- * bằng `Date.now()` (không timer sống lâu), tối đa PRE_TOBOOKOP_RATE_LIMIT
- * dòng/giây TOÀN ENGINE; phần vượt chỉ tăng một counter bounded và ghi một
- * dòng summary (qua `this.log`, không qua productionTrace) khi cửa sổ kế
- * tiếp mở.
- *
- * GIỚI HẠN TRUNG THỰC (không che bằng polling): nếu CẢ HAI feed không nhận
- * được gì cho một order, và không có bằng chứng transport/topic gap nào
- * khác, không có cách cục bộ nào phân biệt với "order không tồn tại". Đây
- * cũng KHÔNG phải packet/raw WebSocket capture -- event đã qua SDK giải mã
- * thành object JS; nếu SDK tự giải mã sai `collectionSlug`, chẩn đoán này
- * cũng không giúp được.
+ * 2. KHÔNG CÔNG BẰNG GIỮA HAI FEED: một quota chung 20/s để một feed lũ
+ *    (reconnect storm) có thể chiếm hết, che mất feed còn lại ngay trong
+ *    cửa sổ cần so sánh để phát hiện bất đồng hai feed. Sửa: quota con
+ *    riêng mỗi feed (PRE_TOBOOKOP_FEED_SHARE), cộng dedupe CÙNG feed
+ *    (không dedupe chéo feed -- đó chính là tín hiệu cần giữ).
  */
 const assert = require("node:assert/strict");
 const { OfferItemEngineV2, STATE } = require("./offer-item-v2/engine-v2");
@@ -68,62 +56,120 @@ function hookRecord() {
   return { recorded, restore: () => { productionTrace.record = real; } };
 }
 
+function itemEvent({ slug, contract, tokenId, orderHash, price, feed }) {
+  return {
+    collectionSlug: slug, nft: { chain: "ethereum", contract, tokenId },
+    kind: "item", orderHash, maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
+    eventTimestamp: Date.now(), receivedAt: Date.now(), hasOrderData: true,
+    event: "item_received_bid", pricePerItem: price, feed
+  };
+}
+
 (async () => {
 
 await check("normal, correctly-mapped event -> pre_toBookOp status=mapped", async () => {
   const { engine } = buildEngine();
   const { recorded, restore } = hookRecord();
   try {
-    engine.apply({
-      collectionSlug: "apuapustajas", nft: { chain: "ethereum", contract: CONTRACT, tokenId: "9001" },
-      kind: "item", orderHash: "0xreal5518", maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
-      eventTimestamp: Date.now(), receivedAt: Date.now(), hasOrderData: true,
-      event: "item_received_bid", pricePerItem: 0.0654, feed: "A"
-    });
+    engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: "9001", orderHash: "0xreal5518", price: 0.0654, feed: "A" }));
     await flush();
     const row = recorded.find(r => r.stage === "pre_toBookOp");
-    assert.ok(row, "pre_toBookOp must be recorded for a tracked collection");
-    assert.equal(row.detail.status, "mapped", "a correctly-mapped NFT must report status=mapped");
-    assert.equal(row.detail.tokenId, "9001");
+    assert.ok(row, "pre_toBookOp must be recorded for an exactly-mapped tracked NFT");
+    assert.equal(row.detail.status, "mapped");
   } finally { restore(); }
 });
 
-await check("THE BUG THIS FIXES: collection is tracked (slug matches) but contract/tokenId lookup fails -- pre_toBookOp still fires with status=unmapped, not silence", async () => {
+// ---- Fix #1 case: 10,000 events for UNTRACKED tokens in the SAME tracked collection
+// must never consume quota, never suppress the tracked token's own evidence ----
+await check("10,000 events for UNTRACKED tokens in the same tracked collection do not consume quota or suppress the tracked NFT's evidence", async () => {
   const { engine } = buildEngine();
   const { recorded, restore } = hookRecord();
   try {
-    // Same tracked collectionSlug, but a WRONG/unregistered contract address
-    // (simulates a byNft mapping bug) -- the raw event genuinely arrived and
-    // belongs to a tracked collection, so evidence must NOT disappear.
-    engine.apply({
-      collectionSlug: "apuapustajas", nft: { chain: "ethereum", contract: "0x9999999999999999999999999999999999999999", tokenId: "9001" },
-      kind: "item", orderHash: "0xlookupbug", maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
-      eventTimestamp: Date.now(), receivedAt: Date.now(), hasOrderData: true,
-      event: "item_received_bid", pricePerItem: 0.05, feed: "A"
-    });
+    for (let i = 0; i < 10000; i++) {
+      engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: String(100000 + i), orderHash: `0xnoise${i}`, price: 0.01, feed: "A" }));
+    }
     await flush();
-    const row = recorded.find(r => r.stage === "pre_toBookOp");
-    assert.ok(row, "pre_toBookOp must still fire -- the collection IS tracked, independent of whether contract/tokenId resolves");
-    assert.equal(row.detail.status, "unmapped", "a tracked-collection event whose contract/tokenId lookup fails must report unmapped, not vanish like a never-received event");
+    assert.equal(recorded.filter(r => r.stage === "pre_toBookOp").length, 0, "10,000 untracked-token events in the same collection must produce ZERO pre_toBookOp rows");
+    assert.equal(engine.preToBookOpCount || 0, 0, "untracked-token events must never touch the rate-limit counter at all");
+
+    // Now the ACTUAL tracked NFT's real event must still get through cleanly.
+    engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: "9001", orderHash: "0xrealafternoise", price: 0.0654, feed: "A" }));
+    await flush();
+    const real = recorded.find(r => r.stage === "pre_toBookOp");
+    assert.ok(real, "the tracked NFT's own event must still be recorded -- its quota was never touched by the 10,000 unrelated events");
+    assert.equal(real.detail.status, "mapped");
   } finally { restore(); }
 });
 
-await check("pre_toBookOp fires even when toBookOp() would separately return null (unusable price) -- distinguishes 'received but dropped downstream' from 'never sent'", async () => {
+// ---- Fix #2 case: feed A flood must not fully consume the shared quota and hide feed B ----
+await check("feed A flood does not hide feed B's evidence -- per-feed fair sub-quota", async () => {
   const { engine } = buildEngine();
   const { recorded, restore } = hookRecord();
   try {
-    engine.apply({
-      collectionSlug: "apuapustajas", nft: { chain: "ethereum", contract: CONTRACT, tokenId: "9001" },
-      kind: "item", orderHash: "0xunusable", maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
-      eventTimestamp: Date.now(), receivedAt: Date.now(), hasOrderData: true,
-      event: "item_received_bid", pricePerItem: 0, feed: "B"
-    });
+    // Flood feed A with 100 DISTINCT orderHashes for the SAME tracked NFT
+    // (distinct hashes so dedupe doesn't collapse them) -- far beyond the
+    // total 20/s cap.
+    for (let i = 0; i < 100; i++) {
+      engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: "9001", orderHash: `0xfloodA${i}`, price: 0.01 + i * 0.0001, feed: "A" }));
+    }
+    // A single feed B event for a DIFFERENT distinct orderHash, interleaved mid-flood.
+    engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: "9001", orderHash: "0xfeedBreal", price: 0.05, feed: "B" }));
     await flush();
-    const pre = recorded.find(r => r.stage === "pre_toBookOp");
-    const rx = recorded.find(r => r.stage === "stream_rx");
-    assert.ok(pre, "pre_toBookOp must fire from the collection-slug check alone, before toBookOp() even runs");
-    assert.equal(pre.detail.status, "mapped", "byNft lookup itself succeeds here -- only the price made toBookOp() reject it downstream");
-    assert.ok(!rx, "sanity: stream_rx must NOT fire -- toBookOp() returned null");
+    const rows = recorded.filter(r => r.stage === "pre_toBookOp");
+    const feedARows = rows.filter(r => r.detail.feed === "A");
+    const feedBRows = rows.filter(r => r.detail.feed === "B");
+    assert.ok(feedARows.length <= Math.ceil(20 * 0.75), `feed A must not exceed its fair sub-quota, got ${feedARows.length}`);
+    assert.equal(feedBRows.length, 1, "feed B's single real event must get through even while feed A is flooding -- not hidden by a shared-only quota");
+  } finally { restore(); }
+});
+
+// ---- Fix #1 case: wrong contract but correct tracked slug+token -> correct specific reason ----
+await check("wrong contract but correct tracked slug+token -> pre_toBookOp status=unmapped-contract", async () => {
+  const { engine } = buildEngine();
+  const { recorded, restore } = hookRecord();
+  try {
+    engine.apply(itemEvent({ slug: "apuapustajas", contract: "0x9999999999999999999999999999999999999999", tokenId: "9001", orderHash: "0xwrongcontract", price: 0.05, feed: "A" }));
+    await flush();
+    const row = recorded.find(r => r.stage === "pre_toBookOp");
+    assert.ok(row, "a tracked token with a wrong contract must still be recorded -- it matched our tokenId via the slug's tracked-row index");
+    assert.equal(row.detail.status, "unmapped-contract");
+  } finally { restore(); }
+});
+
+await check("correct contract+token but tokenId written in a different (canonicalizable) format -> status=unmapped-token", async () => {
+  const { engine } = buildEngine();
+  const { recorded, restore } = hookRecord();
+  try {
+    // "9001" is tracked; "009001" canonicalizes to the same value but the
+    // exact-string byNft lookup misses it.
+    engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: "009001", orderHash: "0xformatdiff", price: 0.05, feed: "A" }));
+    await flush();
+    const row = recorded.find(r => r.stage === "pre_toBookOp");
+    assert.ok(row, "a canonicalizable tokenId-format mismatch for a tracked token+contract must still be recorded");
+    assert.equal(row.detail.status, "unmapped-token");
+  } finally { restore(); }
+});
+
+// ---- Fix #1 case: completely unrelated token format (not canonicalizable, wrong contract) -> skipped entirely ----
+await check("a tokenId format that cannot be canonicalized AND whose contract matches no tracked row is skipped entirely (genuinely unrelated)", async () => {
+  const { engine } = buildEngine();
+  const { recorded, restore } = hookRecord();
+  try {
+    engine.apply(itemEvent({ slug: "apuapustajas", contract: "0x8888888888888888888888888888888888888888", tokenId: "not-a-number-garbage", orderHash: "0xtrulyunrelated", price: 0.05, feed: "A" }));
+    await flush();
+    assert.equal(recorded.filter(r => r.stage === "pre_toBookOp").length, 0, "a non-canonicalizable tokenId with no matching tracked contract must be skipped entirely -- not flagged as possibly ours");
+  } finally { restore(); }
+});
+
+await check("a tokenId format that cannot be canonicalized BUT whose contract matches a tracked row -> status=unmapped-format", async () => {
+  const { engine } = buildEngine();
+  const { recorded, restore } = hookRecord();
+  try {
+    engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: "not-a-number-garbage", orderHash: "0xformatgarbage", price: 0.05, feed: "A" }));
+    await flush();
+    const row = recorded.find(r => r.stage === "pre_toBookOp");
+    assert.ok(row, "a malformed tokenId whose contract matches a tracked row must still be flagged -- one concrete reason to suspect relevance");
+    assert.equal(row.detail.status, "unmapped-format");
   } finally { restore(); }
 });
 
@@ -131,104 +177,87 @@ await check("an UNTRACKED collection never produces pre_toBookOp -- bounded to t
   const { engine } = buildEngine();
   const { recorded, restore } = hookRecord();
   try {
-    engine.apply({
-      collectionSlug: "some-other-collection", nft: { chain: "ethereum", contract: "0x2222222222222222222222222222222222222222", tokenId: "77777" },
-      kind: "item", orderHash: "0xuntracked", maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
-      eventTimestamp: Date.now(), receivedAt: Date.now(), hasOrderData: true,
-      event: "item_received_bid", pricePerItem: 0.01, feed: "A"
-    });
+    engine.apply(itemEvent({ slug: "some-other-collection", contract: "0x2222222222222222222222222222222222222222", tokenId: "77777", orderHash: "0xuntracked", price: 0.01, feed: "A" }));
     await flush();
     assert.ok(!recorded.some(r => r.stage === "pre_toBookOp"), "an untracked collection must never produce a pre_toBookOp row");
   } finally { restore(); }
 });
 
-await check("real rate limiter: 1000 events/second x 2 feeds never exceeds the configured cap", async () => {
+await check("same-feed redundant delivery (same orderHash+event+tokenId, same feed) within the dedupe window is suppressed without consuming quota twice", async () => {
   const { engine } = buildEngine();
   const { recorded, restore } = hookRecord();
   try {
-    // Simulate ~1000 events/s x 2 feeds arriving within the SAME 1-second
-    // window (no real wall-clock wait -- Date.now() stays effectively
-    // constant across this tight loop, exactly the worst-case burst shape).
-    for (let i = 0; i < 2000; i++) {
-      engine.apply({
-        collectionSlug: "apuapustajas", nft: { chain: "ethereum", contract: CONTRACT, tokenId: "9001" },
-        kind: "item", orderHash: `0xburst${i}`, maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
-        eventTimestamp: Date.now(), receivedAt: Date.now(), hasOrderData: true,
-        event: "item_received_bid", pricePerItem: 0.01 + i * 0.0000001, feed: i % 2 === 0 ? "A" : "B"
-      });
-    }
+    engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: "9001", orderHash: "0xdupe1", price: 0.05, feed: "A" }));
+    engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: "9001", orderHash: "0xdupe1", price: 0.05, feed: "A" }));
     await flush();
-    const rows = recorded.filter(r => r.stage === "pre_toBookOp");
-    assert.ok(rows.length <= 20, `rate limiter must cap pre_toBookOp at <=20/s regardless of 2000 events arriving in one window, got ${rows.length}`);
-    assert.ok(rows.length >= 1, "sanity: at least the first events within the cap must still be recorded");
+    const rows = recorded.filter(r => r.stage === "pre_toBookOp" && r.detail.orderHash === "0xdupe1");
+    assert.equal(rows.length, 1, "a redundant same-feed delivery must be deduped -- only one row");
   } finally { restore(); }
 });
 
-await check("summary line reports the correct suppressed count once the next window opens", async () => {
+await check("the SAME key on a DIFFERENT feed is NOT deduped -- cross-feed disagreement evidence is preserved", async () => {
   const { engine } = buildEngine();
   const { recorded, restore } = hookRecord();
-  const logs = [];
-  const realLog = engine.log.bind(engine);
-  engine.log = msg => { logs.push(msg); };
   try {
-    for (let i = 0; i < 50; i++) {
-      engine.apply({
-        collectionSlug: "apuapustajas", nft: { chain: "ethereum", contract: CONTRACT, tokenId: "9001" },
-        kind: "item", orderHash: `0xburst2-${i}`, maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
-        eventTimestamp: Date.now(), receivedAt: Date.now(), hasOrderData: true,
-        event: "item_received_bid", pricePerItem: 0.02 + i * 0.0000001, feed: "A"
-      });
-    }
+    engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: "9001", orderHash: "0xcrossfeed", price: 0.05, feed: "A" }));
+    engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: "9001", orderHash: "0xcrossfeed", price: 0.05, feed: "B" }));
     await flush();
-    assert.equal(engine.preToBookOpSuppressed, 30, `expected exactly 30 suppressed (50 - 20 cap), got ${engine.preToBookOpSuppressed}`);
-    // Force the next window open and fire one more event to trigger the summary log.
-    engine.preToBookOpWindowAt = Date.now() - 1100;
-    engine.apply({
-      collectionSlug: "apuapustajas", nft: { chain: "ethereum", contract: CONTRACT, tokenId: "9001" },
-      kind: "item", orderHash: "0xafterwindow", maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
-      eventTimestamp: Date.now(), receivedAt: Date.now(), hasOrderData: true,
-      event: "item_received_bid", pricePerItem: 0.03, feed: "A"
-    });
-    await flush();
-    const summary = logs.find(l => l.includes("PRE-TOBOOKOP") && l.includes("+30"));
-    assert.ok(summary, `expected a summary log line reporting +30 suppressed, got logs: ${JSON.stringify(logs)}`);
-  } finally { restore(); engine.log = realLog; }
+    const rows = recorded.filter(r => r.stage === "pre_toBookOp" && r.detail.orderHash === "0xcrossfeed");
+    assert.equal(rows.length, 2, "cross-feed deliveries of the SAME key must NOT be deduped -- both feeds' evidence must be preserved to detect disagreement");
+    assert.deepEqual(rows.map(r => r.detail.feed).sort(), ["A", "B"]);
+  } finally { restore(); }
 });
 
-await check("reset() clears the rate-limiter counters -- no stale suppressed count carries into the next run", async () => {
+await check("diagnosticIncomplete counter increments exactly when tracked-NFT evidence is suppressed -- never for unrelated-token skips", async () => {
   const { engine } = buildEngine();
   const { restore } = hookRecord();
   try {
-    for (let i = 0; i < 30; i++) {
-      engine.apply({
-        collectionSlug: "apuapustajas", nft: { chain: "ethereum", contract: CONTRACT, tokenId: "9001" },
-        kind: "item", orderHash: `0xpre-reset-${i}`, maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
-        eventTimestamp: Date.now(), receivedAt: Date.now(), hasOrderData: true,
-        event: "item_received_bid", pricePerItem: 0.04 + i * 0.0000001, feed: "A"
-      });
+    for (let i = 0; i < 10000; i++) {
+      engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: String(200000 + i), orderHash: `0xnoise2-${i}`, price: 0.01, feed: "A" }));
     }
     await flush();
-    assert.ok(engine.preToBookOpSuppressed > 0, "sanity: some suppression happened before reset");
-    engine.reset("reset");
-    assert.equal(engine.preToBookOpWindowAt, 0, "reset() must clear the window timestamp");
-    assert.equal(engine.preToBookOpCount, 0, "reset() must clear the per-window count");
-    assert.equal(engine.preToBookOpSuppressed, 0, "reset() must clear the suppressed count -- no stale number leaks into the next run");
+    assert.equal(engine.stats.preToBookOpDiagnosticIncomplete || 0, 0, "unrelated-token skips must never increment diagnosticIncomplete -- they never reached the rate limiter at all");
+
+    for (let i = 0; i < 100; i++) {
+      engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: "9001", orderHash: `0xflood2-${i}`, price: 0.02 + i * 0.0001, feed: "A" }));
+    }
+    await flush();
+    assert.ok((engine.stats.preToBookOpDiagnosticIncomplete || 0) > 0, "a real tracked-NFT evidence suppression must increment diagnosticIncomplete -- future audits must check this before treating absence as a Stream miss");
   } finally { restore(); }
 });
 
-await check("pre_toBookOp diagnostic never affects apply()/evaluate()/POST outcome or timing -- read-only, no REST, no recovery side effect", async () => {
+await check("reset() clears the rate-limiter window/feed counters and the dedupe map", async () => {
+  const { engine } = buildEngine();
+  const { restore } = hookRecord();
+  try {
+    for (let i = 0; i < 100; i++) {
+      engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: "9001", orderHash: `0xpre-reset-${i}`, price: 0.03 + i * 0.0001, feed: "A" }));
+    }
+    await flush();
+    assert.ok(engine.preToBookOpDedupe.size > 0, "sanity: dedupe map has entries before reset");
+    engine.reset("reset");
+    assert.equal(engine.preToBookOpWindowAt, 0);
+    assert.equal(engine.preToBookOpCount, 0);
+    assert.deepEqual(engine.preToBookOpFeedCount, {});
+    assert.equal(engine.preToBookOpSuppressed, 0);
+    assert.equal(engine.preToBookOpDedupe.size, 0, "reset() must clear the dedupe map entirely");
+  } finally { restore(); }
+});
+
+await check("pre_toBookOp diagnostic never affects apply()/evaluate()/POST outcome or timing -- bounded memory/IO, P0 unaffected", async () => {
   const { engine, book } = buildEngine();
+  // Flood with unrelated-token noise AND real tracked events mixed, exactly
+  // the adversarial shape this fix targets, then measure P0 cost.
+  for (let i = 0; i < 2000; i++) {
+    engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: String(300000 + i), orderHash: `0xmix${i}`, price: 0.01, feed: i % 2 === 0 ? "A" : "B" }));
+  }
   const t0 = process.hrtime.bigint();
-  engine.apply({
-    collectionSlug: "apuapustajas", nft: { chain: "ethereum", contract: CONTRACT, tokenId: "9001" },
-    kind: "item", orderHash: "0xsideeffect", maker: RIVAL, quantity: 1, currency: "WETH", endTime: 0,
-    eventTimestamp: Date.now(), receivedAt: Date.now(), hasOrderData: true,
-    event: "item_received_bid", pricePerItem: 0.05, feed: "A"
-  });
+  engine.apply(itemEvent({ slug: "apuapustajas", contract: CONTRACT, tokenId: "9001", orderHash: "0xsideeffect", price: 0.05, feed: "A" }));
   const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
   await flush();
-  assert.ok(elapsedMs < 20, `apply() took ${elapsedMs}ms -- the diagnostic must stay cheap/synchronous and never slow the hot path`);
+  assert.ok(elapsedMs < 20, `apply() took ${elapsedMs}ms under 2000-event noise -- the diagnostic must stay cheap and never slow the hot path`);
   assert.equal(book.effectiveBest(Date.now()).price, 0.05, "the real event must still apply correctly -- diagnostic is purely additive");
+  assert.ok(engine.preToBookOpDedupe.size <= 500, `dedupe map must stay bounded (PRE_TOBOOKOP_DEDUPE_MAX), got ${engine.preToBookOpDedupe.size}`);
 });
 
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
