@@ -29,6 +29,9 @@
 const { ShardedOpenSeaStream } = require("./stream-sdk");
 
 const DEDUPE_WINDOW_MS = 60 * 1000;
+// More than the normal 60 s working set at observed busy-collection rates,
+// while keeping the long-running dual-feed identity cache strictly bounded.
+const MAX_RECENT_EVENTS = 30000;
 /**
  * How long to wait, after feed B delivers an event feed A has not yet
  * shown, before counting it as "firstSeenOnB" (evidence A actually missed
@@ -126,7 +129,11 @@ class DualStreamFeed {
     const byFeed = this.counters.byFeed[feedId] || (this.counters.byFeed[feedId] = { received: 0 });
     byFeed.received++;
 
-    const key = decoded && decoded.orderHash ? `${decoded.event}:${decoded.orderHash}` : "";
+    // Both independent feeds commonly deliver the same market event. Keep
+    // the redundancy at the transport layer, but dispatch one exact normalized
+    // event to every engine. Include every order-changing field so a newer
+    // version/price/end time for the SAME hash is never hidden as a duplicate.
+    const key = this.deliveryKey(decoded);
     if (key) {
       const prior = this.recent.get(key);
       if (prior) {
@@ -137,26 +144,59 @@ class DualStreamFeed {
           const pending = this.pendingB.get(key);
           if (pending) { clearTimeout(pending); this.pendingB.delete(key); }
         }
-      } else {
-        this.recent.set(key, { feed: feedId, at: Date.now() });
-        if (feedId === "B") {
-          const timer = setTimeout(() => {
-            this.pendingB.delete(key);
-            this.counters.firstSeenOnB++;
-          }, this.confirmWindowMs);
-          timer.unref?.();
-          this.pendingB.set(key, timer);
+        return false;
+      }
+      if (this.recent.size >= MAX_RECENT_EVENTS) {
+        const oldestKey = this.recent.keys().next().value;
+        if (oldestKey !== undefined) {
+          this.recent.delete(oldestKey);
+          const timer = this.pendingB.get(oldestKey);
+          if (timer) { clearTimeout(timer); this.pendingB.delete(oldestKey); }
         }
+      }
+      this.recent.set(key, { feed: feedId, at: Date.now() });
+      if (feedId === "B") {
+        const timer = setTimeout(() => {
+          this.pendingB.delete(key);
+          this.counters.firstSeenOnB++;
+        }, this.confirmWindowMs);
+        timer.unref?.();
+        this.pendingB.set(key, timer);
       }
     }
 
     if (decoded && typeof decoded === "object") decoded.feed = feedId;
     this.onEvent(decoded);
+    return true;
+  }
+
+  deliveryKey(event) {
+    if (!event || !event.orderHash || !event.event) return "";
+    const nft = event.nft || {};
+    // These are the normalized fields that affect MemoryBook mapping/order
+    // state. A different revision, event timestamp, target, maker, price,
+    // quantity, expiry, or trait criteria gets its own identity and dispatch.
+    const signature = [
+      String(event.event), String(event.orderHash).toLowerCase(), Number(event.version) || 0,
+      Number(event.eventTimestamp) || 0, String(event.chain || "").toLowerCase(),
+      String(event.collectionSlug || "").toLowerCase(),
+      String(nft.contract || "").toLowerCase(), String(nft.tokenId || ""),
+      String(event.maker || "").toLowerCase(), Number(event.pricePerItem ?? event.price) || 0,
+      Number(event.quantity) || 0, Number(event.endTime) || 0,
+      String(event.currency || "").toLowerCase(), String(event.kind || ""),
+      JSON.stringify(event.traitCriteria || null), JSON.stringify(event.traitCriteriaList || null)
+    ];
+    return JSON.stringify(signature);
   }
 
   /** Bounded-map maintenance; call periodically (same cadence as any summary timer). */
   sweep(now = Date.now()) {
-    for (const [key, entry] of this.recent) if (now - entry.at > DEDUPE_WINDOW_MS) this.recent.delete(key);
+    for (const [key, entry] of this.recent) {
+      if (now - entry.at <= DEDUPE_WINDOW_MS) continue;
+      this.recent.delete(key);
+      const timer = this.pendingB.get(key);
+      if (timer) { clearTimeout(timer); this.pendingB.delete(key); }
+    }
   }
 
   health() { return this.feedA ? this.feedA.health() : "DISCONNECTED"; }
@@ -196,4 +236,4 @@ class DualStreamFeed {
   }
 }
 
-module.exports = { DualStreamFeed, DEDUPE_WINDOW_MS, B_CONFIRM_WINDOW_MS };
+module.exports = { DualStreamFeed, DEDUPE_WINDOW_MS, B_CONFIRM_WINDOW_MS, MAX_RECENT_EVENTS };

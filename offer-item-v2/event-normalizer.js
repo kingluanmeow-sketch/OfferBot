@@ -62,6 +62,35 @@ const EVENT_OP = Object.freeze({
 });
 
 /**
+ * HAI THANG ĐO KHÁC NHAU TRÊN CÙNG MỘT TRƯỜNG `version`.
+ *
+ *   OpenSea stream-js "Event Versioning"
+ *   (github.com/ProjectOpenSea/stream-js#event-versioning):
+ *
+ *     order revision   item_listed, item_cancelled, item_received_offer,
+ *                      item_received_bid, collection_offer, trait_offer,
+ *                      order_invalidate, order_revalidate
+ *     epoch ms         item_transferred, item_sold, item_metadata_updated
+ *
+ *   "Never compare `version` across different event families or across
+ *   unrelated entities — only compare versions for the same entity within the
+ *   same event family." Hai thang đều đơn điệu nhưng KHÔNG so được với nhau:
+ *   một số 13 chữ số của `item_sold` đặt cạnh revision 1, 2, 3 của chính
+ *   order đó sẽ làm mọi sự kiện họ order sau đó trông như cũ.
+ *
+ *   `item_sold` là event epoch-ms DUY NHẤT tới được sổ (ba cái kia là
+ *   `OP.IGNORE`, bị chặn ở `toBookOp` phía dưới) và nó dùng chính order hash
+ *   vừa khớp — nên đó là đường duy nhất thang epoch-ms lọt vào không gian
+ *   version của một order.
+ */
+const VERSION_FAMILY = Object.freeze({
+  ORDER_REVISION: "orderRevision",
+  EPOCH_MS: "epochMs"
+});
+
+const EPOCH_MS_VERSION_EVENTS = new Set(["item_transferred", "item_sold", "item_metadata_updated"]);
+
+/**
  * Sự kiện nào áp cho NFT nào.
  *
  *   item        đúng một token
@@ -179,6 +208,11 @@ function toBookOp(e) {
     // OpenSea's per-order revision counter (1.25.14): an event carrying a LOWER
     // version than one already seen for the same order is older state.
     version: Number(e.version) > 0 ? Number(e.version) : 0,
+    // Thang đo của `version` ngay trên. So version CHỈ trong cùng family —
+    // xem VERSION_FAMILY phía trên.
+    versionFamily: EPOCH_MS_VERSION_EVENTS.has(eventName)
+      ? VERSION_FAMILY.EPOCH_MS
+      : VERSION_FAMILY.ORDER_REVISION,
 
     collectionSlug: lower(e.collectionSlug),
     contract: e.nft ? lower(e.nft.contract) : "",
@@ -197,7 +231,28 @@ function toBookOp(e) {
     hasOrderData: Boolean(e.hasOrderData),
     // No tombstone for an invalidation: a later revalidation must be able to
     // bring the same order hash back.
-    soft: eventName === "order_invalidate"
+    soft: eventName === "order_invalidate",
+
+    /**
+     * HUỶ CHUNG THẨM CHO CHÍNH ORDER ĐÓ — CHỈ `item_cancelled`.
+     *
+     *   Dùng ở `TokenBook.isStale()`: một huỷ chung thẩm không được để phép so
+     *   `seq` loại bỏ, vì `seq` có thể trộn đồng hồ OpenSea với `receivedAt`
+     *   local (xem `seq` phía trên) và khi đó order CHẾT vẫn tính Best.
+     *
+     *   KHÔNG gồm `item_sold`: theo type của SDK
+     *   (`node_modules/@opensea/sdk/lib/stream/types.d.ts` —
+     *   `ItemSoldEventPayload extends BaseOrderEventPayload`) payload chỉ mang
+     *   `quantity` CỦA LẦN BÁN ĐÓ, không có trường nào nói order còn lại bao
+     *   nhiêu. Một collection offer nhiều quantity bị khớp một phần vì thế
+     *   KHÔNG phân biệt được với khớp hết — coi nó là chung thẩm sẽ xoá và
+     *   đặt bia mộ cho một order VẪN CÒN SỐNG. `item_sold` do đó đi đường
+     *   `seq` như cũ, không đổi.
+     *
+     *   KHÔNG gồm `order_invalidate`: nó tự nhận có thể quay lại
+     *   (`order_revalidate`) — xem `soft` ngay trên.
+     */
+    terminal: eventName === "item_cancelled"
   };
 }
 

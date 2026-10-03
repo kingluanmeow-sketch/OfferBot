@@ -4425,8 +4425,70 @@ class OfferItemEngineV2 {
     if (op.contract && op.tokenId) {
       const key = this.book.byNft && this.book.byNft.get(`${op.contract}:${op.tokenId}`);
       const row = key ? this.rows.get(key) : null;
+      /**
+       * REVALIDATE CŨNG LÀ MỘT MỐC THỨ TỰ — GHI CẢ KHI HÀNG ĐANG TẠM DỪNG.
+       *
+       *   Event này không đi qua `MemoryBook.apply()` (nó không mang giá), nên
+       *   không có gì ghi lại revision của nó. Hệ quả đo được: một
+       *   `order_invalidate` tới muộn mang revision NHỎ HƠN vẫn được áp và xoá
+       *   order mà OpenSea vừa nói là còn hiệu lực — Best tụt dưới thật, ta
+       *   trả thấp và bị vượt. Ghi CHỈ version (không chạm `seq`).
+       *
+       *   TẠM DỪNG CHỈ CHẶN ĐỌC VÀ GỬI, KHÔNG CHẶN SỔ. Đo được: hàng paused
+       *   vẫn chạy `MemoryBook.apply()` — `streamSeq` vẫn tăng, Best vẫn đổi.
+       *   Nếu bỏ revision của revalidate chỉ vì hàng đang dừng thì một
+       *   `order_invalidate` revision THẤP HƠN tới sau vẫn được áp và xoá
+       *   order khỏi Best; lúc Resume ta tin là không có đối thủ rồi trả
+       *   thấp. Nên ghi version TRƯỚC cổng `running`, còn cổng bên dưới vẫn
+       *   tuyệt đối không cho tiêu một lượt đọc nào khi paused/stopped.
+       */
+      const revalBook = key ? this.book.get(key) : null;
+      if (revalBook) revalBook.noteVersion(op);
+      // Từ đây trở xuống là tiêu hạn mức đọc: hàng tạm dừng/đã dừng dừng ở đây.
       if (!row || !row.running) return 0;
-      if (this.hydrating.has(key) || this.pendingReads.has(key)) return 0;
+      /**
+       * MỘT LƯỢT ĐỌC ĐÃ RỜI MÁY KHÔNG TRẢ LỜI ĐƯỢC CÂU HỎI TỚI SAU NÓ
+       *
+       *   Đang có lượt đọc thì câu hỏi này sắp có câu trả lời — NHƯNG chỉ khi
+       *   lượt ấy chưa rời máy. Một lượt đọc bắt đầu TRƯỚC khi
+       *   `order_revalidate` tới trả về ảnh chụp CHƯA có order vừa sống lại,
+       *   và V2 không có nhịp quét nào hỏi lại: Best của ta ở dưới thật, ta
+       *   trả thấp và bị vượt — mất vĩnh viễn.
+       *
+       *   Ghi nợ đúng cơ chế `rereadAfter` mà đường trait đã dùng
+       *   (`resolveTraitScope`): khi lượt đang bay settle trong `mergeBest`,
+       *   nó hỏi lại ĐÚNG MỘT lượt cho ĐÚNG hàng này. Không timer, không
+       *   quét, không thêm lượt đọc thứ hai song song, và giữ nguyên
+       *   `authoritative: false` để không chen lên trước P0.
+       */
+      const inFlight = this.pendingReads.get(key);
+      if (inFlight) {
+        /**
+         * CUNG MOT MILI-GIAY LA KHONG BIET, KHONG PHAI "DA BAO GOM".
+         *
+         *   `startedAt` va `at` deu la `Date.now()` — cung do phan giai
+         *   mili-giay. Mot luot doc roi may TRUOC event nhung roi vao dung
+         *   mili-giay do thi `<` truot, va revalidate bi mat vinh vien. Khi
+         *   bang nhau ta KHONG biet cau tra loi co chua order vua song lai
+         *   hay khong, nen chon phia an toan: ghi no. Gia phai tra toi da la
+         *   MOT luot doc nen thua cho dung hang do.
+         *
+         *   Ghi bang CO, khong bang moc thoi gian: cong tieu thu so
+         *   `rereadAfter > startedAt` (strict), nen mot moc BANG `startedAt`
+         *   se khong bao gio chay. Co cung la chot coalesce — mot luot doc chi
+         *   mang dung mot mon no, nen nhieu revalidate lien tiep van chi sinh
+         *   mot luot doc theo sau.
+         */
+        if (inFlight.startedAt && inFlight.startedAt <= at && !inFlight.rereadPending) {
+          inFlight.rereadPending = true;
+          inFlight.rereadReason = "revalidate";
+          inFlight.rereadAuthoritative = false;
+          this.stats.revalidateFollowUps = (this.stats.revalidateFollowUps || 0) + 1;
+          return 1;
+        }
+        return 0;
+      }
+      if (this.hydrating.has(key)) return 0;
       this.queueRead(row, { reason: "revalidate", authoritative: false, readAt: at, firstRead: false, attempt: 1 });
       return 1;
     }
@@ -5599,10 +5661,20 @@ class OfferItemEngineV2 {
         if (!gateOpened && row && row.running && this.state === STATE.RUNNING) {
           setImmediate(() => { if (this.rows.has(key)) this.queueRead(row, { reason: "gate-fence", authoritative: false, readAt: Date.now(), firstRead: true, attempt: 1 }); });
         }
-        // Một trait offer đã tới trong lúc lượt này bay: hỏi lại một lần.
-        if (readOwner.rereadAfter > (readOwner.startedAt || 0) && row && row.running &&
+        // Một sự kiện đã tới trong lúc lượt này bay (trait offer, hoặc
+        // `order_revalidate` — xem `onOrderRevalidate`): hỏi lại một lần.
+        // Lý do/thẩm quyền do bên ghi nợ chọn; mặc định giữ nguyên hành vi
+        // của đường trait.
+        const rereadDebt = readOwner.rereadPending === true ||
+          readOwner.rereadAfter > (readOwner.startedAt || 0);
+        if (rereadDebt && row && row.running &&
             this.state === STATE.RUNNING) {
-          this.queueRead(row, { reason: "trait-scope", authoritative: true, readAt: now, firstRead: false, attempt: 1 });
+          this.queueRead(row, {
+            reason: readOwner.rereadReason || "trait-scope",
+            authoritative: readOwner.rereadAuthoritative !== undefined
+              ? readOwner.rereadAuthoritative : true,
+            readAt: now, firstRead: false, attempt: 1
+          });
         }
       }
       const pendingTopicRepairAt = this.topicRepairAt.get(key) || 0;

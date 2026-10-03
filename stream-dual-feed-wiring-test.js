@@ -19,7 +19,7 @@
 
 const assert = require("node:assert/strict");
 const { EventType } = require("@opensea/sdk/stream");
-const { DualStreamFeed, B_CONFIRM_WINDOW_MS } = require("./stream-dual-feed");
+const { DualStreamFeed, B_CONFIRM_WINDOW_MS, MAX_RECENT_EVENTS } = require("./stream-dual-feed");
 
 let passed = 0, failed = 0;
 function check(name, fn) {
@@ -248,8 +248,7 @@ const SLUGS_123 = Array.from({ length: 123 }, (_, i) => `c${String(i).padStart(3
   feed.stop();
 }
 
-// ---- Case 9: the SAME event via both A and B produces exactly one onEvent
-// call that matters for SEND purposes -- duplicate is counted, not resent --
+// ---- Case 9: exact cross-feed duplicates are removed before engine dispatch
 {
   const apiKeys = fakeApiKeys(["key-1", "key-2"]);
   const { feed, events } = newFeed(apiKeys);
@@ -258,9 +257,34 @@ const SLUGS_123 = Array.from({ length: 123 }, (_, i) => `c${String(i).padStart(3
   const topicB = feed.feedB.shards[0].stream.client.topics.get("alpha");
   topicA.handler(bid("alpha", 2));
   topicB.handler(bid("alpha", 2));
-  check("the same event via both feeds reaches onEvent twice (engine-level dedupe, not suppressed here) but is counted as a duplicate", () => {
-    assert.equal(events.length, 2, "both deliveries must still reach the engine layer -- MemoryBook.apply is the real dedupe");
+  check("an exact cross-feed duplicate is counted but reaches the engine only once", () => {
+    assert.equal(events.length, 1, "the second identical delivery should be removed before engine dispatch");
     assert.equal(feed.counters.duplicate, 1);
+    assert.equal(feed.counters.crossFeedDuplicate, 1);
+  });
+  feed.stop();
+}
+
+// A new revision or changed normalized order data must not be mistaken for a
+// duplicate merely because OpenSea reused the order hash and event type.
+{
+  const apiKeys = fakeApiKeys(["key-1", "key-2"]);
+  const { feed, events } = newFeed(apiKeys);
+  feed.start(["alpha"]);
+  const topicA = feed.feedA.shards[0].stream.client.topics.get("alpha");
+  const topicB = feed.feedB.shards[0].stream.client.topics.get("alpha");
+  const first = bid("alpha", 9);
+  topicA.handler(first);
+  const revised = bid("alpha", 9);
+  revised.version = 2;
+  revised.payload.event_timestamp = "2026-10-01T00:00:01.000Z";
+  revised.payload.base_price = "20000000000000000";
+  topicB.handler(revised);
+  topicA.handler(revised);
+  check("same hash with a new revision/price reaches the engine; its exact echo is suppressed", () => {
+    assert.equal(events.length, 2);
+    assert.equal(events[1].version, 2);
+    assert.equal(events[1].pricePerItem, 0.02);
     assert.equal(feed.counters.crossFeedDuplicate, 1);
   });
   feed.stop();
@@ -340,6 +364,19 @@ const SLUGS_123 = Array.from({ length: 123 }, (_, i) => `c${String(i).padStart(3
   check("feed A's event is dispatched synchronously in the very next call, regardless of a 500-event B flood just before it", () => {
     assert.equal(events.length, beforeA + 1);
     assert.equal(events[events.length - 1].feed, "A");
+  });
+  feed.stop();
+}
+
+// ---- Case 12: the exact-event cache has a hard 24/7 size bound ------------
+{
+  const apiKeys = fakeApiKeys(["key-1", "key-2"]);
+  const { feed } = newFeed(apiKeys);
+  feed.start(["alpha"]);
+  const topicA = feed.feedA.shards[0].stream.client.topics.get("alpha");
+  for (let i = 1; i <= MAX_RECENT_EVENTS + 1; i++) topicA.handler(bid("alpha", i));
+  check("exact-event dedupe cache stays under its hard bound during a long run", () => {
+    assert.equal(feed.recent.size, MAX_RECENT_EVENTS);
   });
   feed.stop();
 }

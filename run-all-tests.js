@@ -17,6 +17,8 @@ const suites = [
   { file: "pre-tobookop-slug-lifecycle-test.js" },
   { file: "slug-resolution-compensation-test.js" },
   { file: "stale-streak-reconcile-test.js" },
+  { file: "terminal-cancel-ordering-test.js" },
+  { file: "revalidate-ordering-test.js" },
   { file: "recovery-plane-relief-slot-test.js" },
   { file: "opensea-criteria-test.js" },
   { file: "offer-item-v2-recovery-lifecycle-test.js" },
