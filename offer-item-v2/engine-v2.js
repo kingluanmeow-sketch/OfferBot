@@ -502,6 +502,21 @@ class OfferItemEngineV2 {
      * đầy, không cần timer dọn riêng). Dọn hẳn ở reset()/shutdown().
      */
     this.preToBookOpDedupe = new Map();
+    /**
+     * pre_toBookOp: index O(1) theo tokenKey (audit perf -- bản trước
+     * `matchTrackedNft()` duyệt TOÀN BỘ `book.bySlug` của slug mỗi lần exact
+     * `byNft` miss, O(events × tracked rows) ngay trên `apply()`/hot path).
+     *
+     *   Map<slug, { byCanon: Map<canonTokenId, Array<{tokenKey,contract}>>,
+     *               contracts: Map<contract, refcount> }>
+     *
+     *   Cập nhật ĐÚNG MỘT LẦN, O(1), tại `registerRow`/`removeRow`/Start
+     *   (xem `addToPreToBookOpIndex`/`removeFromPreToBookOpIndex`) -- không
+     *   bao giờ quét `this.rows`/`book.bySlug` trong `apply()`. Bounded theo
+     *   đúng số NFT đang theo dõi (mỗi row góp đúng 1 entry `byCanon` + 1
+     *   refcount `contracts`), không phụ thuộc số event.
+     */
+    this.preToBookOpIndex = new Map();
 
     /**
      * NHỊP DỌN LỆNH HẾT HẠN — đồng hồ local, không cần mạng.
@@ -977,6 +992,10 @@ class OfferItemEngineV2 {
 
     // ---- 2. nạp danh sách hàng --------------------------------------
     this.rows.clear();
+    // Index diagnostic pre_toBookOp theo tokenKey -- xoá cùng lúc, không để
+    // mục cũ của hàng đã mất sống sót qua Start lại (registerRow dưới đây
+    // sẽ tự xây lại từ đầu cho danh sách mới).
+    this.preToBookOpIndex.clear();
     const pendingFirstPost = new Set(this.firstPostPending);
     this.firstPostPending.clear();
     for (const row of rows) {
@@ -1130,6 +1149,7 @@ class OfferItemEngineV2 {
       failures: 0,
       retryAt: 0
     });
+    this.addToPreToBookOpIndex(this.rows.get(key));
     /**
      * DANH SÁCH RỖNG TỪ CẤU HÌNH KHÔNG PHẢI LÀ "KHÔNG CÓ TRAIT"
      *
@@ -1698,6 +1718,7 @@ class OfferItemEngineV2 {
     const ts = this.templateState.get(key);
     if (ts && ts.timer) clearTimeout(ts.timer);
     this.templateState.delete(key);
+    if (row) this.removeFromPreToBookOpIndex(row);
     this.rows.delete(key);
     this.book.remove(key);
     this.changed();
@@ -1902,6 +1923,7 @@ class OfferItemEngineV2 {
     this.preToBookOpFeedCount = {};
     this.preToBookOpSuppressed = 0;
     this.preToBookOpDedupe.clear();
+    this.preToBookOpIndex.clear();
     this.http.destroy();
     this.state = STATE.STOPPED;
   }
@@ -2298,46 +2320,78 @@ class OfferItemEngineV2 {
    *   line itself is built in setImmediate. Bounded: 20 lines/s per engine,
    *   the rest counted into one summary line. Only tracked NFTs are logged.
    */
+  /** Thêm một row vào index pre_toBookOp -- O(1), gọi đúng 1 lần ở registerRow. */
+  addToPreToBookOpIndex(row) {
+    if (!row) return;
+    const slug = row.collectionSlug;
+    let bucket = this.preToBookOpIndex.get(slug);
+    if (!bucket) { bucket = { byCanon: new Map(), contracts: new Map() }; this.preToBookOpIndex.set(slug, bucket); }
+    const canon = canonicalTokenId(row.tokenId);
+    if (canon) {
+      const arr = bucket.byCanon.get(canon) || [];
+      arr.push({ tokenKey: row.key, contract: row.contract });
+      bucket.byCanon.set(canon, arr);
+    }
+    bucket.contracts.set(row.contract, (bucket.contracts.get(row.contract) || 0) + 1);
+  }
+
+  /** Gỡ một row khỏi index pre_toBookOp -- O(1)/O(entries cùng canon, luôn nhỏ), gọi đúng 1 lần ở removeRow. */
+  removeFromPreToBookOpIndex(row) {
+    if (!row) return;
+    const slug = row.collectionSlug;
+    const bucket = this.preToBookOpIndex.get(slug);
+    if (!bucket) return;
+    const canon = canonicalTokenId(row.tokenId);
+    if (canon) {
+      const arr = bucket.byCanon.get(canon);
+      if (arr) {
+        const idx = arr.findIndex(e => e.tokenKey === row.key);
+        if (idx >= 0) arr.splice(idx, 1);
+        if (!arr.length) bucket.byCanon.delete(canon);
+      }
+    }
+    const c = bucket.contracts.get(row.contract);
+    if (c !== undefined) {
+      if (c <= 1) bucket.contracts.delete(row.contract);
+      else bucket.contracts.set(row.contract, c - 1);
+    }
+    if (!bucket.byCanon.size && !bucket.contracts.size) this.preToBookOpIndex.delete(slug);
+  }
+
   /**
    * Token của event này có thực sự thuộc một ROW đang theo dõi không, và vì
    * sao tra trực tiếp (`byNft`) thất bại nếu có -- xem ghi chú ở nơi gọi
-   * (sửa lần 3, audit).
+   * (sửa lần 4, audit perf -- lần 3 duyệt `book.bySlug` + `book.get()` cho
+   * MỖI row của slug khi exact miss, O(events × tracked rows) trên hot
+   * path; nay O(1) qua `preToBookOpIndex`, không chạm `this.rows`/`book`).
    *
    *   KHÔNG dùng "cùng collectionSlug" làm bằng chứng đủ: một collection có
    *   thể có hàng nghìn token, tool chỉ theo dõi vài cái. Phải khớp ĐÚNG
-   *   token: tra thẳng (`byNft`) trước; thất bại thì chỉ xét những row THẬT
-   *   đang theo dõi của CHÍNH slug này (`book.bySlug`), so tokenId sau khi
-   *   quy chuẩn (`canonicalTokenId` -- số có số 0 đứng đầu, hex vs decimal).
-   *   Không khớp token nào ⇒ trả null, KHÔNG ghi gì (đây là token khác,
-   *   không liên quan, dù cùng collection).
+   *   token: tra thẳng (`byNft`) trước; thất bại thì tra `preToBookOpIndex`
+   *   theo tokenId quy chuẩn (`canonicalTokenId`), O(1) theo số entry cùng
+   *   canon (luôn rất nhỏ, không phải O(rows của slug)).
+   *
+   *   NHIỀU row tracked trùng CÙNG slug+canonical tokenId (vd. hai contract
+   *   khác nhau cùng số token) -- không đoán, trả "ambiguous" (không suy ra
+   *   contract/row nào).
    */
   matchTrackedNft(slug, rawContract, rawTokenId) {
     if (rawContract && rawTokenId) {
       const exact = this.book.byNft?.get(`${rawContract}:${rawTokenId}`);
       if (exact) return "mapped";
     }
-    const keys = this.book.bySlug?.get(slug);
-    if (!keys || !keys.size) return null;
+    const bucket = this.preToBookOpIndex.get(slug);
+    if (!bucket) return null;
     const canon = canonicalTokenId(rawTokenId);
     if (canon) {
-      for (const k of keys) {
-        const b = this.book.get(k);
-        if (b && canonicalTokenId(b.tokenId) === canon) {
-          // Đúng token (sau quy chuẩn) -- lệch nằm ở contract hay chỉ ở
-          // CÁCH VIẾT tokenId (đã quy chuẩn khớp nhưng chuỗi gốc khác).
-          return b.contract === rawContract ? "unmapped-token" : "unmapped-contract";
-        }
-      }
-      return null; // tokenId quy chuẩn không khớp BẤT KỲ row nào của slug này -- token khác thật, không liên quan
+      const arr = bucket.byCanon.get(canon);
+      if (!arr || !arr.length) return null; // không khớp row tracked nào của slug này -- token khác thật, không liên quan
+      if (arr.length > 1) return "ambiguous"; // nhiều row tracked xung đột cùng slug+canon -- không đoán
+      return arr[0].contract === rawContract ? "unmapped-token" : "unmapped-contract";
     }
-    // tokenId không quy chuẩn được (không phải số/hex hợp lệ) -- chỉ coi là
-    // "có thể liên quan" nếu contract TRÙNG MỘT row đang theo dõi của CHÍNH
-    // slug này (một lý do cụ thể, không chỉ vì cùng collection).
-    for (const k of keys) {
-      const b = this.book.get(k);
-      if (b && rawContract && b.contract === rawContract) return "unmapped-format";
-    }
-    return null;
+    // tokenId không quy chuẩn được -- CHỈ tra O(1) theo refcount contract
+    // của slug này, không quét row nào.
+    return (rawContract && bucket.contracts.has(rawContract)) ? "unmapped-format" : null;
   }
 
   /**

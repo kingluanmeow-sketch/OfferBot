@@ -36,7 +36,8 @@ const STATUSES = new Set(["mapped", "scope-event", "decode-failed", "applied", "
   // "unmapped-contract" (đúng token, sai contract), "unmapped-token" (đúng
   // contract+token nhưng cách viết tokenId gốc khác bản đã lưu),
   // "unmapped-format" (tokenId không quy chuẩn được, chỉ contract khớp).
-  "unmapped-contract", "unmapped-token", "unmapped-format"]);
+  // "ambiguous": nhiều row tracked trùng CÙNG slug+canonical tokenId -- không đoán.
+  "unmapped-contract", "unmapped-token", "unmapped-format", "ambiguous"]);
 // Which independent Stream connection delivered this event (1.25.40 dual-feed
 // redundancy). Lets a production trace distinguish "feed A never got this"
 // from "feed A got it, feed B also got it" from raw stream_rx rows alone.

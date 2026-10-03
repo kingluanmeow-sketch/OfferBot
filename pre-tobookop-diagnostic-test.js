@@ -44,6 +44,7 @@ function buildEngine() {
   const key = `ethereum:${CONTRACT}:9001`;
   const row = { key, running: true, tokenId: "9001", contract: CONTRACT, collectionSlug: "apuapustajas", minPrice: 0.001, maxPrice: 1, step: 0.0001 };
   engine.rows.set(key, row);
+  engine.addToPreToBookOpIndex(row); // registerRow() normally does this; this harness sets rows directly
   const book = engine.book.add({ key, chain: "ethereum", contract: CONTRACT, tokenId: "9001", collectionSlug: "apuapustajas" });
   book.generation = 1; book.hydratedAt = Date.now() - 1000;
   return { engine, key, book };

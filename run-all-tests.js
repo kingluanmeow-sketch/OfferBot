@@ -13,6 +13,7 @@ const suites = [
   { file: "submit-flight-superseded-error-trace-test.js" },
   { file: "production-trace-superseded-ambiguous-test.js" },
   { file: "pre-tobookop-diagnostic-test.js" },
+  { file: "pre-tobookop-index-perf-test.js" },
   { file: "recovery-plane-relief-slot-test.js" },
   { file: "opensea-criteria-test.js" },
   { file: "offer-item-v2-recovery-lifecycle-test.js" },
