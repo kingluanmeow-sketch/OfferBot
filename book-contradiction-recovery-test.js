@@ -28,6 +28,7 @@
 
 const assert = require("node:assert/strict");
 const { OfferItemEngineV2, STATE } = require("./offer-item-v2/engine-v2");
+const { PRIORITY } = require("./rate-limiter");
 
 let passed = 0, failed = 0;
 async function check(name, fn) {
@@ -52,7 +53,8 @@ function bidEvent({ slug, tokenId, maker, price, orderHash, kind = "item", event
 
 function buildEngine({ rows = [{ tokenId: "1", slug: "test-collection" }] } = {}) {
   const resolvers = [];
-  const adapter = { chain: "ethereum", async fetchBest() { return new Promise(res => resolvers.push(res)); } };
+  const reads = [];
+  const adapter = { chain: "ethereum", async fetchBest(row, options) { reads.push({ row, options }); return new Promise(res => resolvers.push(res)); } };
   const engine = new OfferItemEngineV2({ adapter, onLog() {} });
   engine.recovery.pressure = () => false;
   engine.state = STATE.RUNNING;
@@ -72,7 +74,7 @@ function buildEngine({ rows = [{ tokenId: "1", slug: "test-collection" }] } = {}
     book.selfAddress = SELF;
     built.push({ key, row, book });
   }
-  return { engine, resolvers, rows: built, key: built[0].key, row: built[0].row, book: built[0].book };
+  return { engine, resolvers, reads, rows: built, key: built[0].key, row: built[0].row, book: built[0].book };
 }
 
 (async () => {
@@ -105,6 +107,61 @@ await check("no contradiction: a stale replay carrying the SAME (not higher) pri
   engine.apply(bidEvent({ slug: "coll", tokenId: "2", maker: RIVAL, price: 0.02, orderHash: "0xh2", eventTimestamp: t0 + 1000 })); // same price, just older/duplicate
   await flush();
   assert.equal(resolvers.length, 0, "a same-price stale replay is benign (duplicate), not a contradiction -- no read triggered");
+});
+
+// ---- Case 2b: a tracked item bid that reaches the engine but cannot be normalized
+// (for example, an unusable/missing pricePerItem) must not disappear silently.
+await check("tracked item bid with unusable price triggers one asynchronous, per-NFT authority read and repairs Best", async () => {
+  const { engine, book, resolvers, reads } = buildEngine({ rows: [{ tokenId: "2b", slug: "coll" }] });
+  const malformed = bidEvent({ slug: "coll", tokenId: "2b", maker: RIVAL, price: 0.02, orderHash: "0xmissing-price" });
+  delete malformed.pricePerItem;
+  const started = process.hrtime.bigint();
+  engine.apply(malformed);
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.ok(elapsedMs < 20, `unmappable event handling must not wait for REST; apply() took ${elapsedMs}ms`);
+  await flush();
+  assert.equal(resolvers.length, 1, "one targeted recovery read must be queued for the exact tracked NFT");
+  assert.equal(reads[0].options.priority, PRIORITY.P2, "a warm-row recovery must use the background P2 read priority");
+  resolvers[0]({ orderHash: "0xconfirmed", price: 0.0219, orders: [
+    { orderHash: "0xconfirmed", price: 0.0219, maker: RIVAL, kind: "item", endTime: 0, quantity: 1 }
+  ] });
+  await flush();
+  assert.equal(book.effectiveBest(Date.now()).price, 0.0219, "the targeted authority result must repair the local Best");
+});
+
+await check("unmappable item-event recovery is bounded per NFT and does not fan out to other rows", async () => {
+  const { engine, resolvers } = buildEngine({ rows: [
+    { tokenId: "2c", slug: "coll" }, { tokenId: "2d", slug: "coll" }
+  ] });
+  const malformed = tokenId => {
+    const event = bidEvent({ slug: "coll", tokenId, maker: RIVAL, price: 0.02, orderHash: `0xmissing-${tokenId}` });
+    delete event.pricePerItem;
+    return event;
+  };
+  engine.apply(malformed("2c"));
+  engine.apply(malformed("2c")); // second feed / repeat inside the same cooldown
+  await flush();
+  assert.equal(resolvers.length, 1, "repeated unmappable frames for one token must coalesce to one read");
+  assert.equal(engine.hydrating.has("ethereum:0x1111111111111111111111111111111111111111:2d"), false,
+    "a sibling row in the same collection must not be pulled into the targeted read");
+});
+
+await check("untracked and collection-wide events that cannot map do not trigger per-token recovery reads", async () => {
+  const { engine, resolvers } = buildEngine({ rows: [{ tokenId: "2e", slug: "coll" }] });
+  const otherToken = bidEvent({ slug: "coll", tokenId: "999", maker: RIVAL, price: 0.02, orderHash: "0xother" });
+  delete otherToken.pricePerItem;
+  engine.apply(otherToken);
+  engine.apply({
+    collectionSlug: "coll", nft: null, kind: "trait", orderHash: "0xtrait-no-criteria", maker: RIVAL,
+    quantity: 1, currency: "WETH", endTime: 0, eventTimestamp: Date.now(), receivedAt: Date.now(),
+    hasOrderData: true, event: "trait_offer", pricePerItem: 0.08
+  });
+  engine.rows.get("ethereum:0x1111111111111111111111111111111111111111:2e").running = false;
+  const paused = bidEvent({ slug: "coll", tokenId: "2e", maker: RIVAL, price: 0.02, orderHash: "0xpaused" });
+  delete paused.pricePerItem;
+  engine.apply(paused);
+  await flush();
+  assert.equal(resolvers.length, 0, "untracked token, unscoped trait traffic, and paused rows must not fan out reads");
 });
 
 // ---- Case 3: bounded -- repeated contradictions for the SAME key within the cooldown only probe once ----

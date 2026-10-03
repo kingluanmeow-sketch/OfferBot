@@ -7,9 +7,9 @@ const path = require("path");
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_QUEUE = 20000;
 const MAX_BATCH = 256;
-const EVENTS = new Set(["item_received_bid", "collection_offer", "trait_offer", "item_cancelled", "order_invalidate", "order_revalidate"]);
+const EVENTS = new Set(["item_received_bid", "item_received_offer", "collection_offer", "trait_offer", "item_cancelled", "order_invalidate", "order_revalidate"]);
 const STAGES = new Set(["pre_toBookOp", "stream_rx", "stream_mapped", "book_update", "decision", "intent", "blocked", "own_state", "own_update", "send_queued", "http_start", "submit_success", "submit_failure", "rest_request", "rest_response", "bootstrap"]);
-const REASONS = new Set(["SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "topic-not-ready", "shadow-authority-required", "low-balance", "first-read", "template", "own-state-unknown", "not-applied", "applied", "http", "stale-before-post", "quota", "build", "cancelled", "other",
+const REASONS = new Set(["SEND", "ON_TOP", "ABOVE_MAX", "BAD_CONFIG", "NO_TARGET", "topic-not-ready", "shadow-authority-required", "low-balance", "first-read", "template", "own-state-unknown", "unmappable-item-event", "not-applied", "applied", "http", "stale-before-post", "quota", "build", "cancelled", "other",
   // "mapped nhưng không áp" -- phân loại chính xác lý do apply() từ chối (audit:
   // stream_rx ghi "mapped" mà book_update không bao giờ viết ra, không ai biết
   // tại sao). Xem memory-book.js diagnoseApply() và engine-v2.js's book_update.

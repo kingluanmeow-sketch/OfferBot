@@ -184,6 +184,8 @@ const TRAIT_PROBE_COOLDOWN_MS = 60 * 1000;
 const STALE_STREAK_THRESHOLD = 15;
 /** Cooldown RIÊNG cho lượt đọc stale-streak -- không chia sẻ với trait-scope/book-contradiction. */
 const STALE_STREAK_COOLDOWN_MS = 60 * 1000;
+/** Tối đa một authority read / NFT khi Stream gửi item bid không chuẩn hoá được. */
+const UNMAPPABLE_ITEM_EVENT_COOLDOWN_MS = 30 * 1000;
 /** Và tối đa bấy nhiêu token cho MỘT sự kiện trait offer. */
 const TRAIT_PROBE_MAX_PER_EVENT = 8;
 /**
@@ -516,6 +518,8 @@ class OfferItemEngineV2 {
     this.staleStreakCount = new Map();
     /** tokenKey -> lần cuối thực sự xin lượt đọc stale-streak-reconcile. */
     this.staleStreakProbedAt = new Map();
+    /** tokenKey -> lần cuối một item bid không chuẩn hoá được xin authority read. */
+    this.unmappableItemEventProbedAt = new Map();
 
     /**
      * pre_toBookOp: dedupe CÙNG feed (xem PRE_TOBOOKOP_DEDUPE_MS), trần cứng
@@ -1017,6 +1021,7 @@ class OfferItemEngineV2 {
     // mục cũ của hàng đã mất sống sót qua Start lại (registerRow dưới đây
     // sẽ tự xây lại từ đầu cho danh sách mới).
     this.preToBookOpIndex.clear();
+    this.unmappableItemEventProbedAt.clear();
     const pendingFirstPost = new Set(this.firstPostPending);
     this.firstPostPending.clear();
     for (const row of rows) {
@@ -1591,6 +1596,7 @@ class OfferItemEngineV2 {
     for (const state of this.traitScopeRetry.values()) if (state.timer) clearTimeout(state.timer);
     this.traitScopeRetry.clear();
     this.pendingContradiction.clear();
+    this.unmappableItemEventProbedAt.clear();
     // Không timer nào để huỷ (rate limiter pre_toBookOp chỉ là vài số đo
     // bằng Date.now()) -- dọn cho sạch, không để số liệu cửa sổ cũ rơi
     // sang sau Reset.
@@ -1738,6 +1744,7 @@ class OfferItemEngineV2 {
     this.pendingContradiction.delete(key);
     this.staleStreakCount.delete(key);
     this.staleStreakProbedAt.delete(key);
+    this.unmappableItemEventProbedAt.delete(key);
     const ts = this.templateState.get(key);
     if (ts && ts.timer) clearTimeout(ts.timer);
     this.templateState.delete(key);
@@ -2007,7 +2014,10 @@ class OfferItemEngineV2 {
      */
     this.recordPreToBookOpEvidence(event);
     const op = toBookOp(event);
-    if (!op) return;
+    if (!op) {
+      this.recoverUnmappableTrackedItemEvent(event, receivedAt);
+      return;
+    }
     event.mappedMono = mono();
     if (op.op === OP.REVALIDATE) { this.onOrderRevalidate(op, receivedAt); return; }
 
@@ -2531,6 +2541,45 @@ class OfferItemEngineV2 {
     // tokenId không quy chuẩn được -- CHỈ tra O(1) theo refcount contract
     // của slug này, không quét row nào.
     return (rawContract && bucket.contracts.has(rawContract)) ? "unmapped-format" : null;
+  }
+
+  /**
+   * A tracked, token-scoped bid reached the decoded Stream callback but
+   * `toBookOp()` could not produce a usable price. That is positive evidence
+   * of a local decode/data gap, so request one full authority read for only
+   * that NFT. This stays P2 for warm rows, is coalesced by queueRead(), and
+   * has a per-row cooldown; it never runs for collection-wide noise or blocks
+   * another NFT's realtime path. It cannot detect an event absent from both
+   * feeds -- that remains an explicit Stream best-effort limitation.
+   */
+  recoverUnmappableTrackedItemEvent(event, receivedAt = Date.now()) {
+    const eventName = String(event?.event || "");
+    if (eventName !== "item_received_bid" && eventName !== "item_received_offer") return false;
+    const nft = event?.nft;
+    if (!nft?.contract || nft.tokenId == null ||
+        (nft.chain && String(nft.chain).toLowerCase() !== String(this.chain).toLowerCase())) return false;
+    const contract = String(nft.contract).toLowerCase();
+    const tokenId = String(nft.tokenId);
+    const key = this.book.byNft?.get(`${contract}:${tokenId}`);
+    const row = key ? this.rows.get(key) : null;
+    if (!row || !row.running || this.state !== STATE.RUNNING || typeof this.adapter.fetchBest !== "function") return false;
+
+    const now = Date.now();
+    const last = this.unmappableItemEventProbedAt.get(key) || 0;
+    if (now - last < UNMAPPABLE_ITEM_EVENT_COOLDOWN_MS) return false;
+    const queued = this.queueRead(row, {
+      reason: "unmappable-item-event", authoritative: true,
+      readAt: receivedAt, firstRead: false, attempt: 1,
+      correlationId: event.correlationId || ""
+    });
+    // queueRead returns false for a same-row read already in flight too; that
+    // is still safely coalesced there, and should consume this event cooldown.
+    if (queued || this.hydrating.has(key) || this.pendingReads.has(key)) {
+      this.unmappableItemEventProbedAt.set(key, now);
+      this.stats.unmappableItemEventProbes = (this.stats.unmappableItemEventProbes || 0) + 1;
+      return true;
+    }
+    return false;
   }
 
   /**
