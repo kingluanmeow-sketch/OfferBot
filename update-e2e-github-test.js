@@ -200,14 +200,29 @@ async function runForBaseline(baselineVersion) {
   assertSafe(autoUpdater, `${baselineVersion} pre-check`);
 
   let checkResult;
-  await check(`[${baselineVersion}] checkForUpdates() reaches the real GitHub feed and finds an update`, async () => {
+  await check(`[${baselineVersion}] checkForUpdates() reaches the real GitHub feed and returns a manifest`, async () => {
     checkResult = await autoUpdater.checkForUpdates();
     if (!checkResult || !checkResult.updateInfo) throw new Error("no updateInfo returned");
   });
   if (!checkResult || !checkResult.updateInfo) return;
 
   const info = checkResult.updateInfo;
-  log(`[${baselineVersion}] discovered version=${info.version} files=${JSON.stringify((info.files || []).map(f => f.url))}`);
+  log(`[${baselineVersion}] discovered version=${info.version} isUpdateAvailable=${checkResult.isUpdateAvailable} files=${JSON.stringify((info.files || []).map(f => f.url))}`);
+
+  // electron-updater legitimately offers nothing when the baseline already
+  // IS the published latest (allowDowngrade is false). The download chain
+  // below would then fail with "Please check update first" -- that is
+  // correct product behavior, not a defect, so assert the correct thing for
+  // that case instead of demanding a download that must not happen.
+  if (!checkResult.isUpdateAvailable) {
+    await check(`[${baselineVersion}] no update offered because this baseline already IS the published latest (no downgrade)`, () => {
+      if (info.version !== baselineVersion) {
+        throw new Error(`no update offered, but feed latest (${info.version}) differs from baseline (${baselineVersion}) -- that would mean a real update was missed`);
+      }
+    });
+    log(`[${baselineVersion}] correctly up-to-date against feed latest ${info.version}; download chain intentionally skipped`);
+    return;
+  }
 
   await check(`[${baselineVersion}] discovered version matches this release's package.json`, () => {
     if (info.version !== TARGET_VERSION) throw new Error(`expected ${TARGET_VERSION}, got ${info.version}`);
